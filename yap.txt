@@ -1,0 +1,1 @@
+seri porttan gelen veriyi okuyacak ve kumaş metresi kg'i sayan masaüstü python uygulaması

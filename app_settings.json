@@ -1,0 +1,11 @@
+{
+  "port": "COM4",
+  "baud": "9600",
+  "default_unit": "kg",
+  "login_url": "http://192.168.1.30:3000/api/login.cfm",
+  "barcode_lookup_url": "http://192.168.1.30:3000/api/party-lookup.cfm",
+  "save_measurement_url": "http://192.168.1.30:3000/api/save.cfm",
+  "health_url": "http://192.168.1.30:3000/api/health.cfm",
+  "printer_name": "Argox X-1000VL series PPLA",
+  "auto_print": true
+}
