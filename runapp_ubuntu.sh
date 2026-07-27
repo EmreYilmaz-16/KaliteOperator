@@ -16,8 +16,24 @@ if ! python3 -c "import tkinter" >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ ! -d ".venv-linux" ]; then
+if ! python3 -m venv --help >/dev/null 2>&1; then
+  echo "python3-venv modulu kullanilamiyor. Ubuntu'da python3-venv paketi gerekli."
+  echo "Ornek: sudo apt-get update && sudo apt-get install -y python3-venv"
+  exit 1
+fi
+
+if [ -d ".venv-linux" ] && [ ! -f ".venv-linux/bin/activate" ]; then
+  echo "Bozuk veya yarim kalmis .venv-linux bulundu. Yeniden olusturuluyor..."
+  rm -rf .venv-linux
+fi
+
+if [ ! -f ".venv-linux/bin/activate" ]; then
   python3 -m venv .venv-linux
+fi
+
+if [ ! -f ".venv-linux/bin/activate" ]; then
+  echo ".venv-linux olusturulamadi. python3-venv paketini kontrol edin."
+  exit 1
 fi
 
 source .venv-linux/bin/activate

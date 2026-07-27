@@ -64,6 +64,7 @@ Bu script:
 
 - `python3` ve `tkinter` kontrolu yapar
 - yoksa `.venv-linux` olusturur
+- bozuksa `.venv-linux` klasorunu yeniden kurar
 - `requirements.txt` bagimliliklarini kurar
 - uygulamayi baslatir
 
