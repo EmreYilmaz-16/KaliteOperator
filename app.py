@@ -36,6 +36,7 @@ SAVE_MEASUREMENT_URL = ""
 
 # Kaydedilen ölçüm kayıtlarının tutulduğu yerel JSON dosyası (app.py ile aynı klasör).
 LOCAL_SAVE_PATH = Path(__file__).with_name("operator_records.json")
+ERROR_CODE_SETTINGS_PATH = Path(__file__).with_name("error_code_groups.json")
 
 # Port, baud, URL ve yazıcı adı gibi uygulama ayarlarının saklandığı JSON dosyası.
 SETTINGS_PATH = Path(__file__).with_name("app_settings.json")
@@ -217,6 +218,7 @@ class FabricCounterApp:
         self.service_window: tk.Toplevel | None = None
         self.settings_window: tk.Toplevel | None = None
         self.logs_window: tk.Toplevel | None = None
+        self.error_code_admin_window: tk.Toplevel | None = None
         self.measurements: list[Measurement] = []
         self.error_code_groups = copy.deepcopy(ERROR_CODE_GROUPS)
         self.totals = {"m": 0.0, "kg": 0.0}
@@ -275,6 +277,10 @@ class FabricCounterApp:
         self.auto_print_var = tk.BooleanVar(value=True)
         self.operator_notes_var = tk.StringVar()
         self.selected_error_code_var = tk.StringVar(value="Hata kodu secilmedi")
+        self.error_code_admin_status_var = tk.StringVar(value="Hata kodlari hazir")
+        self.error_code_group_var = tk.StringVar()
+        self.error_code_value_var = tk.StringVar()
+        self.error_code_description_var = tk.StringVar()
         self.current_party_data: dict[str, str] = {}
         self.current_user_data: dict[str, str] = {}
         self.current_error_code: dict[str, str] = {}
@@ -288,6 +294,7 @@ class FabricCounterApp:
         self.root.bind("<F11>", self._enter_fullscreen)
         self.root.bind("<Control-Shift-D>", self._toggle_service_window)
         self._load_settings()
+        self._load_error_code_groups()
         self._setup_setting_traces()
         self.refresh_ports()
         self.root.after(200, self._auto_connect_saved_port)
@@ -360,6 +367,17 @@ class FabricCounterApp:
         self._build_settings_page(settings_page)
         self.settings_window.withdraw()
 
+        self.error_code_admin_window = tk.Toplevel(self.root)
+        self.error_code_admin_window.title("Hata Kodu Yonetimi")
+        self.error_code_admin_window.geometry("1260x820+80+80")
+        self.error_code_admin_window.configure(background="#f2f4f7")
+        self.error_code_admin_window.protocol("WM_DELETE_WINDOW", self.error_code_admin_window.withdraw)
+
+        error_code_admin_page = ttk.Frame(self.error_code_admin_window, padding=16)
+        error_code_admin_page.pack(fill="both", expand=True)
+        self._build_error_code_admin_page(error_code_admin_page)
+        self.error_code_admin_window.withdraw()
+
         self.logs_window = tk.Toplevel(self.root)
         self.logs_window.title("Gunluk Kayit Loglari")
         self.logs_window.geometry("1380x820+70+70")
@@ -389,7 +407,7 @@ class FabricCounterApp:
         tüm kayıtları treeview tablosunda gösterir.
         """
         container.columnconfigure(0, weight=1)
-        container.rowconfigure(2, weight=1)
+        container.rowconfigure(3, weight=1)
 
         toolbar = ttk.LabelFrame(container, text="Kayit Filtreleri", padding=12)
         toolbar.grid(row=0, column=0, sticky="ew")
@@ -493,62 +511,94 @@ class FabricCounterApp:
             row=5, column=1, pady=6, sticky="w"
         )
 
-        advanced_frame = ttk.LabelFrame(container, text="Makine ve Hata Kodlari", padding=16)
+        advanced_frame = ttk.LabelFrame(container, text="Makine Ayarlari", padding=16)
         advanced_frame.grid(row=2, column=0, sticky="nsew", pady=(16, 0))
         advanced_frame.columnconfigure(1, weight=1)
-        advanced_frame.rowconfigure(1, weight=1)
 
         ttk.Label(advanced_frame, text="Sifir Toleransi").grid(row=0, column=0, padx=(0, 8), pady=(0, 10), sticky="w")
         ttk.Entry(advanced_frame, textvariable=self.machine_zero_tolerance_var, width=14).grid(
             row=0, column=1, pady=(0, 10), sticky="w"
         )
-        ttk.Button(advanced_frame, text="Hata Kodlarini Uygula", command=self.apply_error_code_groups).grid(
-            row=0, column=2, padx=(12, 0), pady=(0, 10), sticky="e"
-        )
         ttk.Label(
             advanced_frame,
-            text="JSON formatinda grup ve kod listesi duzenlenebilir. Ornek: {\"BOYAHANE HATA KODLARI\": [[\"1\", \"AMBRAJ\"]]}",
-            wraplength=820,
+            text="Makinenin sifir kabul edecegi alt esik degeri burada tanimlanir.",
+            wraplength=720,
             justify="left",
-        ).grid(row=0, column=3, padx=(12, 0), pady=(0, 10), sticky="w")
-
-        self.error_code_groups_text = tk.Text(advanced_frame, wrap="word", height=12, font=("Consolas", 11))
-        self.error_code_groups_text.grid(row=1, column=0, columnspan=4, sticky="nsew")
-        self._populate_error_code_groups_editor()
+        ).grid(row=0, column=2, padx=(12, 0), pady=(0, 10), sticky="w")
 
         info_frame = ttk.LabelFrame(container, text="Bilgi", padding=16)
         info_frame.grid(row=3, column=0, sticky="nsew", pady=(16, 0))
         info_frame.columnconfigure(0, weight=1)
         ttk.Label(
             info_frame,
-            text="Ayarlar penceresi admin kullanicilar icindir. Seri baglanti, varsayilan birim, yazici, servis adresleri, sifir toleransi ve hata kodlari buradan yonetilir.",
+            text="Ayarlar penceresi admin kullanicilar icindir. Seri baglanti, varsayilan birim, yazici, servis adresleri ve sifir toleransi buradan yonetilir. Hata kodlari ayri yonetim ekranindadir.",
             wraplength=900,
             justify="left",
         ).grid(row=0, column=0, sticky="w")
 
-    def _populate_error_code_groups_editor(self) -> None:
-        if not hasattr(self, "error_code_groups_text"):
-            return
-        self.error_code_groups_text.delete("1.0", "end")
-        self.error_code_groups_text.insert(
-            "end",
-            json.dumps(self.error_code_groups, ensure_ascii=False, indent=2),
+    def _build_error_code_admin_page(self, container: ttk.Frame) -> None:
+        container.columnconfigure(0, weight=2)
+        container.columnconfigure(1, weight=3)
+        container.rowconfigure(1, weight=1)
+
+        header = ttk.LabelFrame(container, text="Hata Kodu Yonetimi", padding=12)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        header.columnconfigure(1, weight=1)
+        ttk.Label(
+            header,
+            text="Hata kodlarini grup bazli olarak ekleyin, guncelleyin veya silin. Degisiklikler ayri dosyada saklanir.",
+            wraplength=900,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(header, textvariable=self.error_code_admin_status_var, font=("Segoe UI", 12, "bold")).grid(
+            row=0, column=1, sticky="e"
         )
 
-    def apply_error_code_groups(self) -> None:
-        if not hasattr(self, "error_code_groups_text"):
-            return
-        raw_text = self.error_code_groups_text.get("1.0", "end").strip()
-        try:
-            parsed = json.loads(raw_text) if raw_text else {}
-            self.error_code_groups = self._normalize_error_code_groups(parsed)
-        except (json.JSONDecodeError, ValueError) as exc:
-            messagebox.showerror("Hata Kodlari", f"Hata kodlari kaydedilemedi: {exc}")
-            return
-        self._save_settings()
-        self.status_var.set("Hata kodlari guncellendi")
-        if self.error_code_window is not None and self.error_code_window.winfo_exists():
-            self._close_error_code_window()
+        form_frame = ttk.LabelFrame(container, text="Form", padding=16)
+        form_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 12), pady=(12, 0))
+        form_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(form_frame, text="Grup").grid(row=0, column=0, padx=(0, 8), pady=6, sticky="w")
+        self.error_code_group_combo = ttk.Combobox(form_frame, textvariable=self.error_code_group_var)
+        self.error_code_group_combo.grid(row=0, column=1, pady=6, sticky="ew")
+        ttk.Label(form_frame, text="Kod").grid(row=1, column=0, padx=(0, 8), pady=6, sticky="w")
+        ttk.Entry(form_frame, textvariable=self.error_code_value_var).grid(row=1, column=1, pady=6, sticky="ew")
+        ttk.Label(form_frame, text="Aciklama").grid(row=2, column=0, padx=(0, 8), pady=6, sticky="w")
+        ttk.Entry(form_frame, textvariable=self.error_code_description_var).grid(row=2, column=1, pady=6, sticky="ew")
+
+        action_row = ttk.Frame(form_frame)
+        action_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        ttk.Button(action_row, text="Yeni", command=self.reset_error_code_form).pack(side="left")
+        ttk.Button(action_row, text="Ekle / Guncelle", command=self.upsert_error_code_entry, style="OperatorSuccess.TButton").pack(side="left", padx=(8, 0))
+        ttk.Button(action_row, text="Secileni Sil", command=self.delete_selected_error_code_entry, style="OperatorDanger.TButton").pack(side="left", padx=(8, 0))
+        ttk.Button(action_row, text="Kaydet", command=self.save_error_code_groups, style="OperatorInfo.TButton").pack(side="left", padx=(8, 0))
+        ttk.Button(action_row, text="Varsayilanlari Yukle", command=self.restore_default_error_code_groups).pack(side="left", padx=(8, 0))
+
+        group_row = ttk.Frame(form_frame)
+        group_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        ttk.Button(group_row, text="Grubu Sil", command=self.delete_current_error_code_group).pack(side="left")
+
+        table_frame = ttk.LabelFrame(container, text="Kod Listesi", padding=12)
+        table_frame.grid(row=1, column=1, sticky="nsew", pady=(12, 0))
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+
+        columns = ("group", "code", "description")
+        self.error_code_admin_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=24)
+        self.error_code_admin_tree.heading("group", text="Grup")
+        self.error_code_admin_tree.heading("code", text="Kod")
+        self.error_code_admin_tree.heading("description", text="Aciklama")
+        self.error_code_admin_tree.column("group", width=260, anchor="w")
+        self.error_code_admin_tree.column("code", width=100, anchor="center")
+        self.error_code_admin_tree.column("description", width=420, anchor="w")
+        self.error_code_admin_tree.grid(row=0, column=0, sticky="nsew")
+        self.error_code_admin_tree.bind("<<TreeviewSelect>>", self._on_error_code_admin_select)
+
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.error_code_admin_tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.error_code_admin_tree.configure(yscrollcommand=scrollbar.set)
+
+        self.refresh_error_code_admin_view()
 
     @staticmethod
     def _normalize_error_code_groups(data: object) -> dict[str, list[tuple[str, str]]]:
@@ -568,6 +618,129 @@ class FabricCounterApp:
                 normalized_items.append((str(code), str(description)))
             normalized[group_name] = normalized_items
         return normalized
+
+    def refresh_error_code_admin_view(self) -> None:
+        if hasattr(self, "error_code_group_combo"):
+            self.error_code_group_combo["values"] = list(self.error_code_groups.keys())
+        if not hasattr(self, "error_code_admin_tree"):
+            return
+        for item_id in self.error_code_admin_tree.get_children():
+            self.error_code_admin_tree.delete(item_id)
+        for group_name, items in self.error_code_groups.items():
+            for code, description in items:
+                self.error_code_admin_tree.insert("", "end", values=(group_name, code, description))
+        total = sum(len(items) for items in self.error_code_groups.values())
+        self.error_code_admin_status_var.set(f"{len(self.error_code_groups)} grup / {total} kod")
+
+    def reset_error_code_form(self) -> None:
+        self.error_code_value_var.set("")
+        self.error_code_description_var.set("")
+        if not self.error_code_group_var.get().strip() and self.error_code_groups:
+            self.error_code_group_var.set(next(iter(self.error_code_groups)))
+
+    def _on_error_code_admin_select(self, _event: tk.Event | None = None) -> None:
+        if not hasattr(self, "error_code_admin_tree"):
+            return
+        selection = self.error_code_admin_tree.selection()
+        if not selection:
+            return
+        values = self.error_code_admin_tree.item(selection[0], "values")
+        if len(values) != 3:
+            return
+        self.error_code_group_var.set(str(values[0]))
+        self.error_code_value_var.set(str(values[1]))
+        self.error_code_description_var.set(str(values[2]))
+
+    def upsert_error_code_entry(self) -> None:
+        group_name = self.error_code_group_var.get().strip()
+        code = self.error_code_value_var.get().strip()
+        description = self.error_code_description_var.get().strip()
+        if not group_name or not code or not description:
+            messagebox.showwarning("Hata Kodlari", "Grup, kod ve aciklama alanlari zorunludur.")
+            return
+        items = list(self.error_code_groups.get(group_name, []))
+        updated = False
+        for index, (existing_code, _existing_description) in enumerate(items):
+            if existing_code == code:
+                items[index] = (code, description)
+                updated = True
+                break
+        if not updated:
+            items.append((code, description))
+            items.sort(key=lambda item: item[0])
+        self.error_code_groups[group_name] = items
+        self.refresh_error_code_admin_view()
+        self.error_code_admin_status_var.set("Hata kodu guncellendi, kaydetmeyi unutmayin")
+
+    def delete_selected_error_code_entry(self) -> None:
+        group_name = self.error_code_group_var.get().strip()
+        code = self.error_code_value_var.get().strip()
+        if not group_name or not code or group_name not in self.error_code_groups:
+            messagebox.showwarning("Hata Kodlari", "Silmek icin once tablodan bir kayit secin.")
+            return
+        remaining = [(item_code, item_description) for item_code, item_description in self.error_code_groups[group_name] if item_code != code]
+        if len(remaining) == len(self.error_code_groups[group_name]):
+            messagebox.showwarning("Hata Kodlari", "Secilen kod bulunamadi.")
+            return
+        if remaining:
+            self.error_code_groups[group_name] = remaining
+        else:
+            del self.error_code_groups[group_name]
+        self.refresh_error_code_admin_view()
+        self.reset_error_code_form()
+        self.error_code_admin_status_var.set("Kod silindi, kaydetmeyi unutmayin")
+
+    def delete_current_error_code_group(self) -> None:
+        group_name = self.error_code_group_var.get().strip()
+        if not group_name or group_name not in self.error_code_groups:
+            messagebox.showwarning("Hata Kodlari", "Silmek icin gecerli bir grup secin.")
+            return
+        if not messagebox.askyesno("Hata Kodlari", f"{group_name} grubundaki tum kodlar silinsin mi?"):
+            return
+        del self.error_code_groups[group_name]
+        self.refresh_error_code_admin_view()
+        self.reset_error_code_form()
+        self.error_code_admin_status_var.set("Grup silindi, kaydetmeyi unutmayin")
+
+    def restore_default_error_code_groups(self) -> None:
+        self.error_code_groups = copy.deepcopy(ERROR_CODE_GROUPS)
+        self.refresh_error_code_admin_view()
+        self.reset_error_code_form()
+        self.error_code_admin_status_var.set("Varsayilan kodlar yuklendi, kaydetmeyi unutmayin")
+
+    def save_error_code_groups(self) -> None:
+        try:
+            ERROR_CODE_SETTINGS_PATH.write_text(
+                json.dumps(self.error_code_groups, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            messagebox.showerror("Hata Kodlari", f"Kaydetme basarisiz: {exc}")
+            return
+        self.error_code_admin_status_var.set(f"Hata kodlari kaydedildi: {ERROR_CODE_SETTINGS_PATH.name}")
+        if self.error_code_window is not None and self.error_code_window.winfo_exists():
+            self._close_error_code_window()
+
+    def _load_error_code_groups(self) -> None:
+        loaded_data: object = self.error_code_groups
+        if ERROR_CODE_SETTINGS_PATH.exists():
+            try:
+                loaded_data = json.loads(ERROR_CODE_SETTINGS_PATH.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                loaded_data = copy.deepcopy(ERROR_CODE_GROUPS)
+        elif SETTINGS_PATH.exists():
+            try:
+                legacy_data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+                if isinstance(legacy_data, dict) and "error_code_groups" in legacy_data:
+                    loaded_data = legacy_data["error_code_groups"]
+            except (OSError, json.JSONDecodeError):
+                loaded_data = copy.deepcopy(ERROR_CODE_GROUPS)
+        try:
+            self.error_code_groups = self._normalize_error_code_groups(loaded_data)
+        except ValueError:
+            self.error_code_groups = copy.deepcopy(ERROR_CODE_GROUPS)
+        self.refresh_error_code_admin_view()
+        self.reset_error_code_form()
 
     def _build_login_page(self, container: ttk.Frame) -> None:
         """
@@ -744,6 +917,12 @@ class FabricCounterApp:
         actions.grid(row=0, column=1, sticky="e")
         ttk.Label(actions, textvariable=self.logged_user_var, font=("Segoe UI", 14, "bold")).pack(side="left", padx=(0, 12))
         self.settings_button = ttk.Button(actions, text="Ayarlar", command=self.show_settings_window, style="OperatorNeutral.TButton")
+        self.error_code_admin_button = ttk.Button(
+            actions,
+            text="Hata Kod Yonetimi",
+            command=self.show_error_code_admin_window,
+            style="OperatorNeutral.TButton",
+        )
         self.logs_button = ttk.Button(actions, text="Kayit Loglari", command=self.show_logs_window, style="OperatorNeutral.TButton")
         self.service_button = ttk.Button(actions, text="Debug/Test", command=self.show_service_window, style="OperatorNeutral.TButton")
         ttk.Button(actions, text="Cikis", command=self.logout, style="OperatorDanger.TButton").pack(side="left")
@@ -1077,6 +1256,20 @@ class FabricCounterApp:
         self.logs_window.lift()
         self.logs_window.focus_force()
 
+    def show_error_code_admin_window(self) -> None:
+        if not self.current_user_data:
+            self.login_status_var.set("Hata kodu yonetimine erismek icin once giris yapin")
+            return
+        if not self._is_admin():
+            self.operator_status_var.set("Bu kullanici hata kodu yonetimine erisemez")
+            return
+        if self.error_code_admin_window is None:
+            return
+        self.refresh_error_code_admin_view()
+        self.error_code_admin_window.deiconify()
+        self.error_code_admin_window.lift()
+        self.error_code_admin_window.focus_force()
+
     def _toggle_service_window(self, _event: tk.Event | None = None) -> str | None:
         """
         Ctrl+Shift+D kısayoluyla debug penceresini açıp kapatir (toggle).
@@ -1200,6 +1393,8 @@ class FabricCounterApp:
             self.service_window.withdraw()
         if self.settings_window is not None:
             self.settings_window.withdraw()
+        if self.error_code_admin_window is not None:
+            self.error_code_admin_window.withdraw()
         if self.logs_window is not None:
             self.logs_window.withdraw()
         self.current_user_data = {}
@@ -1223,13 +1418,20 @@ class FabricCounterApp:
         Kullanıcı rolüne göre üst menü butonlarını gösterir/gizler.
         Admin ise Ayarlar, Kayıt Logları ve Debug/Test butonları görünür olur.
         """
-        if not hasattr(self, "service_button") or not hasattr(self, "settings_button") or not hasattr(self, "logs_button"):
+        if (
+            not hasattr(self, "service_button")
+            or not hasattr(self, "settings_button")
+            or not hasattr(self, "logs_button")
+            or not hasattr(self, "error_code_admin_button")
+        ):
             return
         self.service_button.pack_forget()
         self.settings_button.pack_forget()
+        self.error_code_admin_button.pack_forget()
         self.logs_button.pack_forget()
         if self._is_admin():
             self.settings_button.pack(side="left", padx=(0, 8))
+            self.error_code_admin_button.pack(side="left", padx=(0, 8))
             self.logs_button.pack(side="left", padx=(0, 8))
             self.service_button.pack(side="left", padx=(0, 8))
 
@@ -1380,11 +1582,6 @@ class FabricCounterApp:
         self.health_url_var.set(str(data.get("health_url", self.health_url_var.get())))
         self.printer_name_var.set(str(data.get("printer_name", self.printer_name_var.get())))
         self.auto_print_var.set(bool(data.get("auto_print", self.auto_print_var.get())))
-        try:
-            self.error_code_groups = self._normalize_error_code_groups(data.get("error_code_groups", self.error_code_groups))
-        except ValueError:
-            self.error_code_groups = copy.deepcopy(ERROR_CODE_GROUPS)
-        self._populate_error_code_groups_editor()
 
     def _save_settings(self) -> None:
         """
@@ -1402,7 +1599,6 @@ class FabricCounterApp:
             "health_url": self.health_url_var.get().strip(),
             "printer_name": self.printer_name_var.get().strip(),
             "auto_print": self.auto_print_var.get(),
-            "error_code_groups": self.error_code_groups,
         }
         try:
             SETTINGS_PATH.write_text(json.dumps(settings_payload, ensure_ascii=True, indent=2), encoding="utf-8")
