@@ -1,0 +1,82 @@
+{
+  "BOYAHANE HATA KODLARI": [
+    [
+      "1",
+      "AMBRAJ"
+    ],
+    [
+      "10",
+      "KIMYEVI LEKESI"
+    ],
+    [
+      "2",
+      "KIRIK"
+    ],
+    [
+      "3",
+      "SURTME"
+    ],
+    [
+      "4",
+      "TUYLENME"
+    ],
+    [
+      "5",
+      "METAL SURTME"
+    ],
+    [
+      "6",
+      "DELIK-YIRTIK"
+    ],
+    [
+      "7",
+      "BOYA LEKESI"
+    ],
+    [
+      "8",
+      "SUZME"
+    ],
+    [
+      "9",
+      "SU LEKESI"
+    ]
+  ],
+  "DOKUMA HATA KODLARI": [
+    [
+      "51",
+      "BANT"
+    ],
+    [
+      "52",
+      "COZGUDEN IZ"
+    ],
+    [
+      "53",
+      "ATKIDAN IZ"
+    ],
+    [
+      "54",
+      "DOK. YAG IZ"
+    ],
+    [
+      "55",
+      "DOK. IP CEKMESI"
+    ],
+    [
+      "56",
+      "DOK. HATASI"
+    ],
+    [
+      "57",
+      "DOK. DELIK YIRTIK"
+    ],
+    [
+      "58",
+      "DOK. SU LEKESI"
+    ],
+    [
+      "59",
+      "TEST"
+    ]
+  ]
+}
