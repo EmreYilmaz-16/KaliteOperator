@@ -34,9 +34,72 @@ LOGIN_URL = ""
 BARCODE_LOOKUP_URL = ""
 SAVE_MEASUREMENT_URL = ""
 
+DARK_THEME = {
+    "bg": "#111827",
+    "panel": "#1f2937",
+    "panel_alt": "#243244",
+    "panel_warm": "#3a2a1e",
+    "panel_green": "#183128",
+    "text": "#e5edf7",
+    "muted": "#93a4b8",
+    "accent_blue": "#60a5fa",
+    "accent_warm": "#f59e0b",
+    "accent_green": "#34d399",
+    "success": "#15803d",
+    "success_active": "#166534",
+    "warn": "#b45309",
+    "warn_active": "#92400e",
+    "info": "#1d4ed8",
+    "info_active": "#1e40af",
+    "danger": "#b91c1c",
+    "danger_active": "#991b1b",
+    "neutral": "#475569",
+    "neutral_active": "#334155",
+    "button": "#243244",
+    "button_active": "#2f4158",
+    "button_text": "#e5edf7",
+    "border": "#334155",
+    "input_bg": "#0f172a",
+    "selection": "#2563eb",
+    "error": "#f87171",
+}
+
+LIGHT_THEME = {
+    "bg": "#f2f4f7",
+    "panel": "#ffffff",
+    "panel_alt": "#e6f4fb",
+    "panel_warm": "#fdf1e7",
+    "panel_green": "#e9f7ef",
+    "text": "#17212b",
+    "muted": "#556371",
+    "accent_blue": "#0c4a6e",
+    "accent_warm": "#9a6700",
+    "accent_green": "#0f5f35",
+    "success": "#1f7a3e",
+    "success_active": "#176132",
+    "warn": "#d97706",
+    "warn_active": "#b65f00",
+    "info": "#0f5f8f",
+    "info_active": "#0c4c72",
+    "danger": "#a63d40",
+    "danger_active": "#832e31",
+    "neutral": "#5b6777",
+    "neutral_active": "#495463",
+    "button": "#e2e8f0",
+    "button_active": "#cbd5e1",
+    "button_text": "#17212b",
+    "border": "#cbd5e1",
+    "input_bg": "#ffffff",
+    "selection": "#2563eb",
+    "error": "#b42318",
+}
+
 # Kaydedilen ölçüm kayıtlarının tutulduğu yerel JSON dosyası (app.py ile aynı klasör).
 LOCAL_SAVE_PATH = Path(__file__).with_name("operator_records.json")
 ERROR_CODE_SETTINGS_PATH = Path(__file__).with_name("error_code_groups.json")
+ASSETS_PATH = Path(__file__).with_name("assets")
+LIGHT_LOGO_PATH = ASSETS_PATH / "pbs-logo-blue.png"
+DARK_LOGO_PATH = ASSETS_PATH / "pbs-logo-white.png"
 
 # Port, baud, URL ve yazıcı adı gibi uygulama ayarlarının saklandığı JSON dosyası.
 SETTINGS_PATH = Path(__file__).with_name("app_settings.json")
@@ -239,6 +302,7 @@ class FabricCounterApp:
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="9600")
         self.default_unit_var = tk.StringVar(value="kg")
+        self.theme_mode_var = tk.StringVar(value="dark")
         self.machine_zero_tolerance_var = tk.StringVar(value=f"{MACHINE_ZERO_TOLERANCE:.2f}")
         self.login_url_var = tk.StringVar(value=LOGIN_URL)
         self.barcode_lookup_url_var = tk.StringVar(value=BARCODE_LOOKUP_URL)
@@ -287,6 +351,7 @@ class FabricCounterApp:
         self.error_code_window: tk.Toplevel | None = None
         self.available_printers: list[str] = []
         self.web_health_check_inflight = False
+        self.login_logo_images: dict[str, tk.PhotoImage] = {}
 
         self._configure_styles()
         self._build_ui()
@@ -294,12 +359,51 @@ class FabricCounterApp:
         self.root.bind("<F11>", self._enter_fullscreen)
         self.root.bind("<Control-Shift-D>", self._toggle_service_window)
         self._load_settings()
+        self._apply_theme()
         self._load_error_code_groups()
         self._setup_setting_traces()
         self.refresh_ports()
         self.root.after(200, self._auto_connect_saved_port)
         self.root.after(500, self._schedule_connectivity_checks)
         self.root.after(100, self.process_serial_queue)
+
+    def _get_theme_colors(self) -> dict[str, str]:
+        return LIGHT_THEME if self.theme_mode_var.get().strip().lower() == "light" else DARK_THEME
+
+    def _apply_theme(self) -> None:
+        self._configure_styles()
+        colors = self._get_theme_colors()
+        for window_name in ("root", "settings_window", "logs_window", "service_window", "error_code_window", "error_code_admin_window"):
+            widget = getattr(self, window_name, None)
+            if widget is not None:
+                try:
+                    widget.configure(background=colors["bg"])
+                except tk.TclError:
+                    pass
+        for text_name in ("log_text", "payload_preview"):
+            widget = getattr(self, text_name, None)
+            if widget is not None:
+                widget.configure(
+                    background=colors["input_bg"],
+                    foreground=colors["text"],
+                    insertbackground=colors["text"],
+                    selectbackground=colors["selection"],
+                )
+        if hasattr(self, "status_bar"):
+            self.status_bar.configure(background=colors["bg"])
+        if hasattr(self, "login_status_label"):
+            self.login_status_label.configure(foreground=colors["accent_blue"])
+        if hasattr(self, "login_logo_label"):
+            self._update_login_logo()
+        if hasattr(self, "operator_status_label"):
+            self.operator_status_label.configure(foreground=colors["accent_green"])
+        if hasattr(self, "footer_hint_label"):
+            self.footer_hint_label.configure(foreground=colors["muted"])
+        self._update_serial_connection_status()
+        self._update_printer_connection_status()
+        current_health = self.webservice_connection_var.get().strip()
+        if current_health.startswith("WEB: AYARLANMADI"):
+            self._set_status_label(self.webservice_status_label, self.webservice_connection_var, current_health, colors["accent_warm"])
 
     def _configure_styles(self) -> None:
         """
@@ -308,37 +412,77 @@ class FabricCounterApp:
         'OperatorNeutral' buton stilleri ile 'InfoBlue/Warm/Green' kart stilleri burada.
         """
         style = ttk.Style(self.root)
+        colors = self._get_theme_colors()
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("TFrame", background="#f2f4f7")
-        style.configure("TLabelframe", background="#f2f4f7")
-        style.configure("TLabelframe.Label", font=("Segoe UI", 16, "bold"), foreground="#17212b")
-        style.configure("TLabel", background="#f2f4f7", foreground="#17212b", font=("Segoe UI", 14))
-        style.configure("TButton", font=("Segoe UI", 16, "bold"), padding=(18, 12))
-        style.configure("TEntry", font=("Segoe UI", 18), padding=10)
-        style.configure("TCombobox", font=("Segoe UI", 16))
-        style.configure("TCheckbutton", background="#f2f4f7", font=("Segoe UI", 14))
-        style.configure("OperatorSuccess.TButton", background="#1f7a3e", foreground="#ffffff", borderwidth=0)
-        style.map("OperatorSuccess.TButton", background=[("active", "#176132")])
-        style.configure("OperatorWarn.TButton", background="#d97706", foreground="#ffffff", borderwidth=0)
-        style.map("OperatorWarn.TButton", background=[("active", "#b65f00")])
-        style.configure("OperatorInfo.TButton", background="#0f5f8f", foreground="#ffffff", borderwidth=0)
-        style.map("OperatorInfo.TButton", background=[("active", "#0c4c72")])
-        style.configure("OperatorDanger.TButton", background="#a63d40", foreground="#ffffff", borderwidth=0)
-        style.map("OperatorDanger.TButton", background=[("active", "#832e31")])
-        style.configure("OperatorNeutral.TButton", background="#5b6777", foreground="#ffffff", borderwidth=0)
-        style.map("OperatorNeutral.TButton", background=[("active", "#495463")])
-        style.configure("InfoBlue.TLabelframe", background="#e6f4fb", borderwidth=1, relief="solid")
-        style.configure("InfoBlue.TLabelframe.Label", background="#e6f4fb", foreground="#0c4a6e", font=("Segoe UI", 15, "bold"))
-        style.configure("InfoWarm.TLabelframe", background="#fdf1e7", borderwidth=1, relief="solid")
-        style.configure("InfoWarm.TLabelframe.Label", background="#fdf1e7", foreground="#9a3412", font=("Segoe UI", 15, "bold"))
-        style.configure("InfoGreen.TLabelframe", background="#e9f7ef", borderwidth=1, relief="solid")
-        style.configure("InfoGreen.TLabelframe.Label", background="#e9f7ef", foreground="#166534", font=("Segoe UI", 15, "bold"))
-        style.configure("CardValueBlue.TLabel", background="#e6f4fb", foreground="#0c4a6e", font=("Segoe UI", 20, "bold"))
-        style.configure("CardValueWarm.TLabel", background="#fdf1e7", foreground="#9a3412", font=("Segoe UI", 20, "bold"))
-        style.configure("CardValueGreen.TLabel", background="#e9f7ef", foreground="#166534", font=("Segoe UI", 30, "bold"))
+        self.root.configure(background=colors["bg"])
+        style.configure("TFrame", background=colors["bg"])
+        style.configure("TLabelframe", background=colors["panel"], bordercolor=colors["border"], borderwidth=1, relief="solid")
+        style.configure("TLabelframe.Label", background=colors["panel"], font=("Segoe UI", 16, "bold"), foreground=colors["text"])
+        style.configure("TLabel", background=colors["bg"], foreground=colors["text"], font=("Segoe UI", 14))
+        style.configure(
+            "TButton",
+            font=("Segoe UI", 16, "bold"),
+            padding=(18, 12),
+            borderwidth=0,
+            background=colors["button"],
+            foreground=colors["button_text"],
+            focuscolor=colors["selection"],
+        )
+        style.map(
+            "TButton",
+            background=[("pressed", colors["button_active"]), ("active", colors["button_active"])],
+            foreground=[("disabled", colors["muted"]), ("pressed", colors["button_text"]), ("active", colors["button_text"])],
+        )
+        style.configure(
+            "TEntry",
+            font=("Segoe UI", 18),
+            padding=10,
+            fieldbackground=colors["input_bg"],
+            foreground=colors["text"],
+            insertcolor=colors["text"],
+            bordercolor=colors["border"],
+        )
+        style.map("TEntry", fieldbackground=[("readonly", colors["input_bg"]), ("focus", colors["input_bg"])] )
+        style.configure(
+            "TCombobox",
+            font=("Segoe UI", 16),
+            fieldbackground=colors["input_bg"],
+            foreground=colors["text"],
+            arrowcolor=colors["text"],
+            bordercolor=colors["border"],
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", colors["input_bg"]), ("focus", colors["input_bg"])],
+            foreground=[("readonly", colors["text"]), ("focus", colors["text"])],
+        )
+        style.configure("TCheckbutton", background=colors["bg"], foreground=colors["text"], font=("Segoe UI", 14))
+        style.map("TCheckbutton", background=[("active", colors["bg"])], foreground=[("active", colors["text"])])
+        style.configure("OperatorSuccess.TButton", background=colors["success"], foreground="#ffffff", borderwidth=0)
+        style.map("OperatorSuccess.TButton", background=[("active", colors["success_active"])])
+        style.configure("OperatorWarn.TButton", background=colors["warn"], foreground="#ffffff", borderwidth=0)
+        style.map("OperatorWarn.TButton", background=[("active", colors["warn_active"])])
+        style.configure("OperatorInfo.TButton", background=colors["info"], foreground="#ffffff", borderwidth=0)
+        style.map("OperatorInfo.TButton", background=[("active", colors["info_active"])])
+        style.configure("OperatorDanger.TButton", background=colors["danger"], foreground="#ffffff", borderwidth=0)
+        style.map("OperatorDanger.TButton", background=[("active", colors["danger_active"])])
+        style.configure("OperatorNeutral.TButton", background=colors["neutral"], foreground="#ffffff", borderwidth=0)
+        style.map("OperatorNeutral.TButton", background=[("active", colors["neutral_active"])])
+        style.configure("InfoBlue.TLabelframe", background=colors["panel_alt"], bordercolor=colors["border"], borderwidth=1, relief="solid")
+        style.configure("InfoBlue.TLabelframe.Label", background=colors["panel_alt"], foreground=colors["accent_blue"], font=("Segoe UI", 15, "bold"))
+        style.configure("InfoWarm.TLabelframe", background=colors["panel_warm"], bordercolor=colors["border"], borderwidth=1, relief="solid")
+        style.configure("InfoWarm.TLabelframe.Label", background=colors["panel_warm"], foreground=colors["accent_warm"], font=("Segoe UI", 15, "bold"))
+        style.configure("InfoGreen.TLabelframe", background=colors["panel_green"], bordercolor=colors["border"], borderwidth=1, relief="solid")
+        style.configure("InfoGreen.TLabelframe.Label", background=colors["panel_green"], foreground=colors["accent_green"], font=("Segoe UI", 15, "bold"))
+        style.configure("CardValueBlue.TLabel", background=colors["panel_alt"], foreground=colors["accent_blue"], font=("Segoe UI", 20, "bold"))
+        style.configure("CardValueWarm.TLabel", background=colors["panel_warm"], foreground=colors["accent_warm"], font=("Segoe UI", 20, "bold"))
+        style.configure("CardValueGreen.TLabel", background=colors["panel_green"], foreground=colors["accent_green"], font=("Segoe UI", 30, "bold"))
+        style.configure("Treeview", background=colors["panel"], fieldbackground=colors["panel"], foreground=colors["text"], bordercolor=colors["border"])
+        style.map("Treeview", background=[("selected", colors["selection"])], foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading", background=colors["panel_alt"], foreground=colors["text"], bordercolor=colors["border"], font=("Segoe UI", 12, "bold"))
 
     def _build_ui(self) -> None:
         """
@@ -359,7 +503,7 @@ class FabricCounterApp:
         self.settings_window = tk.Toplevel(self.root)
         self.settings_window.title("Ayarlar")
         self.settings_window.geometry("1100x760+60+60")
-        self.settings_window.configure(background="#f2f4f7")
+        self.settings_window.configure(background=self._get_theme_colors()["bg"])
         self.settings_window.protocol("WM_DELETE_WINDOW", self.settings_window.withdraw)
 
         settings_page = ttk.Frame(self.settings_window, padding=16)
@@ -370,7 +514,7 @@ class FabricCounterApp:
         self.error_code_admin_window = tk.Toplevel(self.root)
         self.error_code_admin_window.title("Hata Kodu Yonetimi")
         self.error_code_admin_window.geometry("1260x820+80+80")
-        self.error_code_admin_window.configure(background="#f2f4f7")
+        self.error_code_admin_window.configure(background=self._get_theme_colors()["bg"])
         self.error_code_admin_window.protocol("WM_DELETE_WINDOW", self.error_code_admin_window.withdraw)
 
         error_code_admin_page = ttk.Frame(self.error_code_admin_window, padding=16)
@@ -381,7 +525,7 @@ class FabricCounterApp:
         self.logs_window = tk.Toplevel(self.root)
         self.logs_window.title("Gunluk Kayit Loglari")
         self.logs_window.geometry("1380x820+70+70")
-        self.logs_window.configure(background="#f2f4f7")
+        self.logs_window.configure(background=self._get_theme_colors()["bg"])
         self.logs_window.protocol("WM_DELETE_WINDOW", self.logs_window.withdraw)
 
         logs_page = ttk.Frame(self.logs_window, padding=16)
@@ -392,7 +536,7 @@ class FabricCounterApp:
         self.service_window = tk.Toplevel(self.root)
         self.service_window.title("Debug ve Test Ekrani")
         self.service_window.geometry("1280x860+40+40")
-        self.service_window.configure(background="#f2f4f7")
+        self.service_window.configure(background=self._get_theme_colors()["bg"])
         self.service_window.protocol("WM_DELETE_WINDOW", self.service_window.withdraw)
 
         serial_page = ttk.Frame(self.service_window, padding=16)
@@ -507,8 +651,16 @@ class FabricCounterApp:
         ttk.Label(service_frame, text="Yazici").grid(row=4, column=0, padx=(0, 8), pady=6, sticky="w")
         self.settings_printer_combo = ttk.Combobox(service_frame, textvariable=self.printer_name_var, width=38)
         self.settings_printer_combo.grid(row=4, column=1, pady=6, sticky="ew")
+        ttk.Label(service_frame, text="Tema").grid(row=5, column=0, padx=(0, 8), pady=6, sticky="w")
+        ttk.Combobox(
+            service_frame,
+            textvariable=self.theme_mode_var,
+            values=["light", "dark"],
+            state="readonly",
+            width=18,
+        ).grid(row=5, column=1, pady=6, sticky="w")
         ttk.Checkbutton(service_frame, text="Kayit sonrasi otomatik bas", variable=self.auto_print_var).grid(
-            row=5, column=1, pady=6, sticky="w"
+            row=6, column=1, pady=6, sticky="w"
         )
 
         advanced_frame = ttk.LabelFrame(container, text="Makine Ayarlari", padding=16)
@@ -760,17 +912,22 @@ class FabricCounterApp:
         card.grid(row=0, column=0)
         card.columnconfigure(0, weight=1)
 
+        self._load_login_logos()
+        self.login_logo_label = tk.Label(card, borderwidth=0, highlightthickness=0)
+        self.login_logo_label.grid(row=0, column=0, sticky="w", pady=(0, 18))
+        self._update_login_logo()
+
         ttk.Label(card, text="Kalite Operator Sistemi", font=("Segoe UI", 30, "bold")).grid(
-            row=0, column=0, sticky="w", pady=(0, 8)
+            row=1, column=0, sticky="w", pady=(0, 8)
         )
         ttk.Label(
             card,
             text="Operatora ozel sifre ile giris yapin.",
             font=("Segoe UI", 16),
-        ).grid(row=1, column=0, sticky="w", pady=(0, 24))
+        ).grid(row=2, column=0, sticky="w", pady=(0, 24))
 
         form = ttk.Frame(card)
-        form.grid(row=2, column=0, sticky="ew")
+        form.grid(row=3, column=0, sticky="ew")
         form.columnconfigure(0, weight=1)
 
         ttk.Label(form, text="Sifre", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w")
@@ -778,15 +935,40 @@ class FabricCounterApp:
         self.password_entry.grid(row=1, column=0, sticky="ew", pady=(8, 24))
         self.password_entry.bind("<Return>", lambda _event: self.login())
 
-        ttk.Button(card, text="Giris Yap", command=self.login).grid(row=3, column=0, sticky="ew")
-        ttk.Label(
+        ttk.Button(card, text="Giris Yap", command=self.login).grid(row=4, column=0, sticky="ew")
+        self.login_status_label = ttk.Label(
             card,
             textvariable=self.login_status_var,
             font=("Segoe UI", 14, "bold"),
-            foreground="#0c4a6e",
-        ).grid(row=4, column=0, sticky="w", pady=(18, 0))
+            foreground=self._get_theme_colors()["accent_blue"],
+        )
+        self.login_status_label.grid(row=5, column=0, sticky="w", pady=(18, 0))
 
         self.root.after(50, self.password_entry.focus_set)
+
+    def _load_login_logos(self) -> None:
+        if self.login_logo_images:
+            return
+        for theme_name, logo_path in (("light", LIGHT_LOGO_PATH), ("dark", DARK_LOGO_PATH)):
+            if not logo_path.exists():
+                continue
+            try:
+                self.login_logo_images[theme_name] = tk.PhotoImage(file=str(logo_path))
+            except tk.TclError:
+                continue
+
+    def _update_login_logo(self) -> None:
+        if not hasattr(self, "login_logo_label"):
+            return
+        colors = self._get_theme_colors()
+        theme_name = "light" if self.theme_mode_var.get().strip().lower() == "light" else "dark"
+        logo_image = self.login_logo_images.get(theme_name)
+        self.login_logo_label.configure(background=colors["panel"])
+        if logo_image is None:
+            self.login_logo_label.configure(image="", text="PBS", fg=colors["text"], bg=colors["panel"], font=("Segoe UI", 22, "bold"))
+            return
+        self.login_logo_label.configure(image=logo_image, text="", bg=colors["panel"])
+        self.login_logo_label.image = logo_image
 
     def _build_serial_page(self, container: ttk.Frame) -> None:
         """
@@ -870,6 +1052,13 @@ class FabricCounterApp:
         self.tree.pack(fill="both", expand=True)
 
         self.log_text = tk.Text(log_frame, wrap="word", state="disabled", height=18)
+        self.log_text.configure(
+            background=self._get_theme_colors()["input_bg"],
+            foreground=self._get_theme_colors()["text"],
+            insertbackground=self._get_theme_colors()["text"],
+            selectbackground=self._get_theme_colors()["selection"],
+            relief="flat",
+        )
         self.log_text.pack(fill="both", expand=True)
 
         actions = ttk.Frame(container, padding=(0, 16, 0, 0))
@@ -955,12 +1144,13 @@ class FabricCounterApp:
             row=0, column=5, pady=6
         )
 
-        ttk.Label(
+        self.operator_status_label = ttk.Label(
             scan_frame,
             textvariable=self.operator_status_var,
             font=("Segoe UI", 16, "bold"),
-            foreground="#0f5f35",
-        ).grid(row=1, column=0, columnspan=5, pady=(12, 0), sticky="w")
+            foreground=self._get_theme_colors()["accent_green"],
+        )
+        self.operator_status_label.grid(row=1, column=0, columnspan=5, pady=(12, 0), sticky="w")
 
         content = ttk.Frame(container)
         content.grid(row=2, column=0, sticky="nsew", pady=(18, 0))
@@ -1045,36 +1235,37 @@ class FabricCounterApp:
         footer = ttk.Frame(container)
         footer.grid(row=3, column=0, sticky="ew", pady=(18, 0))
         footer.columnconfigure(0, weight=1)
-        ttk.Label(
+        self.footer_hint_label = ttk.Label(
             footer,
             text="Tam ekran cikis: ESC   |   Tam ekran geri al: F11   |   Servis penceresi: Ctrl+Shift+D",
             font=("Segoe UI", 12),
-            foreground="#556371",
-        ).grid(row=0, column=0, sticky="w")
-        status_bar = tk.Frame(footer, background="#f2f4f7")
-        status_bar.grid(row=1, column=0, sticky="w", pady=(8, 0))
+            foreground=self._get_theme_colors()["muted"],
+        )
+        self.footer_hint_label.grid(row=0, column=0, sticky="w")
+        self.status_bar = tk.Frame(footer, background=self._get_theme_colors()["bg"])
+        self.status_bar.grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.serial_status_label = tk.Label(
-            status_bar,
+            self.status_bar,
             textvariable=self.serial_connection_var,
             font=("Segoe UI", 12, "bold"),
-            fg="#0f5f35",
-            bg="#f2f4f7",
+            fg=self._get_theme_colors()["accent_green"],
+            bg=self._get_theme_colors()["bg"],
         )
         self.serial_status_label.pack(side="left", padx=(0, 18))
         self.webservice_status_label = tk.Label(
-            status_bar,
+            self.status_bar,
             textvariable=self.webservice_connection_var,
             font=("Segoe UI", 12, "bold"),
-            fg="#9a6700",
-            bg="#f2f4f7",
+            fg=self._get_theme_colors()["accent_warm"],
+            bg=self._get_theme_colors()["bg"],
         )
         self.webservice_status_label.pack(side="left", padx=(0, 18))
         self.printer_status_label = tk.Label(
-            status_bar,
+            self.status_bar,
             textvariable=self.printer_connection_var,
             font=("Segoe UI", 12, "bold"),
-            fg="#9a6700",
-            bg="#f2f4f7",
+            fg=self._get_theme_colors()["accent_warm"],
+            bg=self._get_theme_colors()["bg"],
         )
         self.printer_status_label.pack(side="left")
 
@@ -1089,6 +1280,13 @@ class FabricCounterApp:
         payload_frame.rowconfigure(0, weight=1)
 
         self.payload_preview = tk.Text(payload_frame, wrap="word", state="disabled", height=16)
+        self.payload_preview.configure(
+            background=self._get_theme_colors()["input_bg"],
+            foreground=self._get_theme_colors()["text"],
+            insertbackground=self._get_theme_colors()["text"],
+            selectbackground=self._get_theme_colors()["selection"],
+            relief="flat",
+        )
         self.payload_preview.grid(row=0, column=0, sticky="nsew")
         self.refresh_payload_preview()
 
@@ -1143,7 +1341,7 @@ class FabricCounterApp:
         self.error_code_window = tk.Toplevel(self.root)
         self.error_code_window.title("Hata Kodlari")
         self.error_code_window.geometry("1120x760+80+80")
-        self.error_code_window.configure(background="#f2f4f7")
+        self.error_code_window.configure(background=self._get_theme_colors()["bg"])
         self.error_code_window.transient(self.root)
         self.error_code_window.grab_set()
         self.error_code_window.protocol("WM_DELETE_WINDOW", self._close_error_code_window)
@@ -1535,6 +1733,7 @@ class FabricCounterApp:
             self.port_var,
             self.baud_var,
             self.default_unit_var,
+            self.theme_mode_var,
             self.machine_zero_tolerance_var,
             self.login_url_var,
             self.barcode_lookup_url_var,
@@ -1554,6 +1753,7 @@ class FabricCounterApp:
         - Web servis sağlık kontrolu başlatır
         """
         self._save_settings()
+        self._apply_theme()
         self._update_serial_connection_status()
         self._update_printer_connection_status()
         self._request_webservice_health_check()
@@ -1575,6 +1775,7 @@ class FabricCounterApp:
         self.port_var.set(str(data.get("port", self.port_var.get())))
         self.baud_var.set(str(data.get("baud", self.baud_var.get())))
         self.default_unit_var.set(str(data.get("default_unit", self.default_unit_var.get())))
+        self.theme_mode_var.set(str(data.get("theme_mode", self.theme_mode_var.get())))
         self.machine_zero_tolerance_var.set(str(data.get("machine_zero_tolerance", self.machine_zero_tolerance_var.get())))
         self.login_url_var.set(str(data.get("login_url", self.login_url_var.get())))
         self.barcode_lookup_url_var.set(str(data.get("barcode_lookup_url", self.barcode_lookup_url_var.get())))
@@ -1592,6 +1793,7 @@ class FabricCounterApp:
             "port": self.port_var.get().strip(),
             "baud": self.baud_var.get().strip(),
             "default_unit": self.default_unit_var.get().strip(),
+            "theme_mode": self.theme_mode_var.get().strip(),
             "machine_zero_tolerance": self.machine_zero_tolerance_var.get().strip(),
             "login_url": self.login_url_var.get().strip(),
             "barcode_lookup_url": self.barcode_lookup_url_var.get().strip(),
@@ -1640,16 +1842,17 @@ class FabricCounterApp:
         """
         port_name = self.port_var.get().strip()
         available_ports = list(self.port_combo.cget("values")) if hasattr(self, "port_combo") else []
+        colors = self._get_theme_colors()
         if self.reader and self.reader.is_alive():
-            self._set_status_label(self.serial_status_label, self.serial_connection_var, f"COM: BAGLI ({port_name})", "#0f5f35")
+            self._set_status_label(self.serial_status_label, self.serial_connection_var, f"COM: BAGLI ({port_name})", colors["accent_green"])
             return
         if port_name and port_name in available_ports:
-            self._set_status_label(self.serial_status_label, self.serial_connection_var, f"COM: HAZIR ({port_name})", "#9a6700")
+            self._set_status_label(self.serial_status_label, self.serial_connection_var, f"COM: HAZIR ({port_name})", colors["accent_warm"])
             return
         if port_name:
-            self._set_status_label(self.serial_status_label, self.serial_connection_var, f"COM: BULUNAMADI ({port_name})", "#b42318")
+            self._set_status_label(self.serial_status_label, self.serial_connection_var, f"COM: BULUNAMADI ({port_name})", colors["error"])
             return
-        self._set_status_label(self.serial_status_label, self.serial_connection_var, "COM: SECILMEDI", "#b42318")
+        self._set_status_label(self.serial_status_label, self.serial_connection_var, "COM: SECILMEDI", colors["error"])
 
     def _update_printer_connection_status(self) -> None:
         """
@@ -1657,13 +1860,14 @@ class FabricCounterApp:
         HAZIR (yeşil) / BULUNAMADI (kırmızı) / SECiLMEDi (kırmızı).
         """
         printer_name = self.printer_name_var.get().strip()
+        colors = self._get_theme_colors()
         if printer_name and printer_name in self.available_printers:
-            self._set_status_label(self.printer_status_label, self.printer_connection_var, f"YAZICI: HAZIR ({printer_name})", "#0f5f35")
+            self._set_status_label(self.printer_status_label, self.printer_connection_var, f"YAZICI: HAZIR ({printer_name})", colors["accent_green"])
             return
         if printer_name:
-            self._set_status_label(self.printer_status_label, self.printer_connection_var, f"YAZICI: BULUNAMADI ({printer_name})", "#b42318")
+            self._set_status_label(self.printer_status_label, self.printer_connection_var, f"YAZICI: BULUNAMADI ({printer_name})", colors["error"])
             return
-        self._set_status_label(self.printer_status_label, self.printer_connection_var, "YAZICI: SECILMEDI", "#b42318")
+        self._set_status_label(self.printer_status_label, self.printer_connection_var, "YAZICI: SECILMEDI", colors["error"])
 
     def _resolve_health_url(self) -> str:
         """
@@ -1696,8 +1900,9 @@ class FabricCounterApp:
         thread'inde _check_webservice_health()'i başlatır.
         """
         health_url = self._resolve_health_url()
+        colors = self._get_theme_colors()
         if not health_url:
-            self._set_status_label(self.webservice_status_label, self.webservice_connection_var, "WEB: AYARLANMADI", "#9a6700")
+            self._set_status_label(self.webservice_status_label, self.webservice_connection_var, "WEB: AYARLANMADI", colors["accent_warm"])
             return
         if self.web_health_check_inflight:
             return
@@ -1710,6 +1915,7 @@ class FabricCounterApp:
         hata kodunda WEB: HATA, bağlanamıyorsa WEB: ULAŞILAMIYOR gösterir.
         web_health_check_inflight bayrağını sonunda sıfırlar.
         """
+        colors = self._get_theme_colors()
         try:
             request = urllib.request.Request(health_url, method="GET")
             with urllib.request.urlopen(request, timeout=5) as response:
@@ -1721,7 +1927,7 @@ class FabricCounterApp:
                         self.webservice_status_label,
                         self.webservice_connection_var,
                         f"WEB: BAGLI ({health_url})",
-                        "#0f5f35",
+                        colors["accent_green"],
                     ),
                 )
             else:
@@ -1731,7 +1937,7 @@ class FabricCounterApp:
                         self.webservice_status_label,
                         self.webservice_connection_var,
                         f"WEB: HATA ({status_code})",
-                        "#b42318",
+                        colors["error"],
                     ),
                 )
         except (urllib.error.URLError, TimeoutError):
@@ -1741,7 +1947,7 @@ class FabricCounterApp:
                     self.webservice_status_label,
                     self.webservice_connection_var,
                     "WEB: ULASILAMIYOR",
-                    "#b42318",
+                    colors["error"],
                 ),
             )
         finally:
