@@ -309,6 +309,7 @@ class FabricCounterApp:
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="9600")
         self.default_unit_var = tk.StringVar(value="kg")
+        self.operating_system_var = tk.StringVar(value="windows" if sys.platform.startswith("win") else "linux")
         self.theme_mode_var = tk.StringVar(value="dark")
         self.machine_zero_tolerance_var = tk.StringVar(value=f"{MACHINE_ZERO_TOLERANCE:.2f}")
         self.login_url_var = tk.StringVar(value=LOGIN_URL)
@@ -658,16 +659,24 @@ class FabricCounterApp:
         ttk.Label(service_frame, text="Yazici").grid(row=4, column=0, padx=(0, 8), pady=6, sticky="w")
         self.settings_printer_combo = ttk.Combobox(service_frame, textvariable=self.printer_name_var, width=38)
         self.settings_printer_combo.grid(row=4, column=1, pady=6, sticky="ew")
-        ttk.Label(service_frame, text="Tema").grid(row=5, column=0, padx=(0, 8), pady=6, sticky="w")
+        ttk.Label(service_frame, text="Isletim Sistemi").grid(row=5, column=0, padx=(0, 8), pady=6, sticky="w")
+        ttk.Combobox(
+            service_frame,
+            textvariable=self.operating_system_var,
+            values=["windows", "linux"],
+            state="readonly",
+            width=18,
+        ).grid(row=5, column=1, pady=6, sticky="w")
+        ttk.Label(service_frame, text="Tema").grid(row=6, column=0, padx=(0, 8), pady=6, sticky="w")
         ttk.Combobox(
             service_frame,
             textvariable=self.theme_mode_var,
             values=["light", "dark"],
             state="readonly",
             width=18,
-        ).grid(row=5, column=1, pady=6, sticky="w")
+        ).grid(row=6, column=1, pady=6, sticky="w")
         ttk.Checkbutton(service_frame, text="Kayit sonrasi otomatik bas", variable=self.auto_print_var).grid(
-            row=6, column=1, pady=6, sticky="w"
+            row=7, column=1, pady=6, sticky="w"
         )
 
         advanced_frame = ttk.LabelFrame(container, text="Makine Ayarlari", padding=16)
@@ -1740,6 +1749,7 @@ class FabricCounterApp:
             self.port_var,
             self.baud_var,
             self.default_unit_var,
+            self.operating_system_var,
             self.theme_mode_var,
             self.machine_zero_tolerance_var,
             self.login_url_var,
@@ -1782,6 +1792,7 @@ class FabricCounterApp:
         self.port_var.set(str(data.get("port", self.port_var.get())))
         self.baud_var.set(str(data.get("baud", self.baud_var.get())))
         self.default_unit_var.set(str(data.get("default_unit", self.default_unit_var.get())))
+        self.operating_system_var.set(str(data.get("operating_system", self.operating_system_var.get())))
         self.theme_mode_var.set(str(data.get("theme_mode", self.theme_mode_var.get())))
         self.machine_zero_tolerance_var.set(str(data.get("machine_zero_tolerance", self.machine_zero_tolerance_var.get())))
         self.login_url_var.set(str(data.get("login_url", self.login_url_var.get())))
@@ -1800,6 +1811,7 @@ class FabricCounterApp:
             "port": self.port_var.get().strip(),
             "baud": self.baud_var.get().strip(),
             "default_unit": self.default_unit_var.get().strip(),
+            "operating_system": self.operating_system_var.get().strip(),
             "theme_mode": self.theme_mode_var.get().strip(),
             "machine_zero_tolerance": self.machine_zero_tolerance_var.get().strip(),
             "login_url": self.login_url_var.get().strip(),
@@ -1962,14 +1974,20 @@ class FabricCounterApp:
 
     def _refresh_printers(self) -> None:
         """
-        win32print ile sistemdeki yazıcıları listeler, available_printers'a kaydeder
-        ve ilgili combobox'ları günceller. win32print bulunamazsa liste boş kalır.
+        Secili isletim sistemine gore yazicilari listeler ve combobox'lari gunceller.
         """
-        try:
-            import win32print as _wp  # type: ignore[import-untyped]
-            printer_names = [p[2] for p in _wp.EnumPrinters(_wp.PRINTER_ENUM_LOCAL | _wp.PRINTER_ENUM_CONNECTIONS)]
-        except Exception:
-            printer_names = []
+        operating_system = self.operating_system_var.get().strip().lower()
+        if operating_system == "linux":
+            try:
+                printer_names = label_printer.list_printers_linux()
+            except Exception:
+                printer_names = []
+        else:
+            try:
+                import win32print as _wp  # type: ignore[import-untyped]
+                printer_names = [p[2] for p in _wp.EnumPrinters(_wp.PRINTER_ENUM_LOCAL | _wp.PRINTER_ENUM_CONNECTIONS)]
+            except Exception:
+                printer_names = []
 
         self.available_printers = printer_names
 
@@ -2573,20 +2591,24 @@ class FabricCounterApp:
 
     def _do_print_label(self, payload: dict, printer_name: str) -> None:
         """
-        label_printer.print_label_win() çağrısını yapıp etiketi basma işlemini gerçekleştirir.
+        Secili isletim sistemine gore etiketi basar.
         Arka plan thread'inde çalışır. Hata oluşursa operatör durum çubuğuna mesaj yazar.
         """
         try:
-            label_printer.print_label_win(
-                printer_name=printer_name,
-                parti=str(payload.get("party_no", "")),
-                sarj=str(payload.get("sarj_no", "")),
-                kalite=str(payload.get("kalite", "")),
-                renk=str(payload.get("renk", "")),
-                mt=float(payload.get("meter", 0)),
-                kg=float(payload.get("kg", 0)),
-                barcode=str(payload.get("barcode", "")),
-            )
+            print_kwargs = {
+                "printer_name": printer_name,
+                "parti": str(payload.get("party_no", "")),
+                "sarj": str(payload.get("sarj_no", "")),
+                "kalite": str(payload.get("kalite", "")),
+                "renk": str(payload.get("renk", "")),
+                "mt": float(payload.get("meter", 0)),
+                "kg": float(payload.get("kg", 0)),
+                "barcode": str(payload.get("barcode", "")),
+            }
+            if self.operating_system_var.get().strip().lower() == "linux":
+                label_printer.print_label_linux(**print_kwargs)
+            else:
+                label_printer.print_label_win(**print_kwargs)
             self.root.after(0, lambda: self.operator_status_var.set("Etiket yazdirildi."))
         except Exception as exc:  # noqa: BLE001
             self.root.after(0, lambda e=exc: self.operator_status_var.set(f"Yazici hatasi: {e}"))

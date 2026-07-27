@@ -42,6 +42,42 @@ pip install -r requirements.txt
 python app.py
 ```
 
+## Ubuntu Run
+
+Ubuntu tarafinda uygulama calisabilir, ancak Windows'a ozel GDI etiket yazdirma ozelligi desteklenmez.
+
+Gerekli temel paketler:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-tk
+```
+
+Hazir script:
+
+```bash
+chmod +x runapp_ubuntu.sh
+./runapp_ubuntu.sh
+```
+
+Bu script:
+
+- `python3` ve `tkinter` kontrolu yapar
+- yoksa `.venv-linux` olusturur
+- `requirements.txt` bagimliliklarini kurar
+- uygulamayi baslatir
+
+Ubuntu notlari:
+
+- Seri port cihazlari genelde `/dev/ttyUSB0`, `/dev/ttyUSB1`, `/dev/ttyS0` gibi gorunur
+- Gerekirse kullaniciyi `dialout` grubuna eklemek gerekir:
+
+```bash
+sudo usermod -a -G dialout $USER
+```
+
+- Etiket yazdirma kodu Windows `pywin32`/GDI tabanlidir; Ubuntu'da bu kisim calismaz
+
 ## Customer Delivery
 
 `python app.py` yaklaşımı son kullanıcı için garanti değildir. Hedef makinede doğru Python sürümü, `pyserial`, `pywin32` ve uygun çalışma klasörü gerekir.

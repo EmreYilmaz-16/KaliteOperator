@@ -1,6 +1,8 @@
 """GDI label printing for Argox X-1000VL - 76x76mm square label, 90deg CW rotation."""
 from __future__ import annotations
 
+from pathlib import Path
+
 _TR = str.maketrans("sScCgGuUoOiI", "sScCgGuUoOiI")
 _TR = str.maketrans(
     "\u015f\u015e\u00e7\u00c7\u011f\u011e\u00fc\u00dc\u00f6\u00d6\u0131\u0130",
@@ -10,6 +12,68 @@ _TR = str.maketrans(
 
 def _a(text: str) -> str:
     return str(text).translate(_TR)
+
+
+def _build_label_image(
+    parti: str,
+    sarj: str,
+    kalite: str,
+    renk: str,
+    mt: float,
+    kg: float,
+    barcode: str,
+):
+    import barcode as bc_lib
+    from barcode.writer import ImageWriter
+    from PIL import Image, ImageDraw, ImageFont
+    import io
+
+    label = Image.new("RGB", (900, 900), "white")
+    draw = ImageDraw.Draw(label)
+    font_title = ImageFont.load_default()
+    font_value = ImageFont.load_default()
+
+    mt_str = f"{mt:.2f}".replace(".", ",")
+    kg_str = f"{kg:.2f}".replace(".", ",")
+    safe_bc = "".join(c for c in str(barcode) if c.isalnum() or c in "-. $/+%")
+
+    lines = [
+        f"Parti  : {parti}",
+        f"Sarj   : {sarj}",
+        f"Kalite : {kalite}",
+        f"Renk   : {renk}",
+        "",
+        f"Mt : {mt_str}",
+        f"Kg : {kg_str}",
+    ]
+    y_pos = 35
+    for line in lines:
+        draw.text((35, y_pos), _a(line), fill="black", font=font_title)
+        y_pos += 45
+
+    if safe_bc:
+        buf = io.BytesIO()
+        bc_lib.get("code128", safe_bc, writer=ImageWriter()).write(
+            buf,
+            options={
+                "module_height": 18.0,
+                "module_width": 0.35,
+                "quiet_zone": 0.8,
+                "font_size": 10,
+                "text_distance": 2.0,
+                "background": "white",
+                "foreground": "black",
+                "write_text": True,
+            },
+        )
+        buf.seek(0)
+        barcode_image = Image.open(buf).convert("RGB")
+        barcode_image.thumbnail((780, 220))
+        x_pos = (label.width - barcode_image.width) // 2
+        label.paste(barcode_image, (x_pos, 420))
+        draw.text((35, 700), safe_bc, fill="black", font=font_value)
+
+    return label
 
 
 def print_label_win(
@@ -121,6 +185,54 @@ def print_label_win(
     hDC.EndPage()
     hDC.EndDoc()
     hDC.DeleteDC()
+
+
+def list_printers_linux() -> list[str]:
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["lpstat", "-a"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return []
+
+    printers: list[str] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        printers.append(line.split()[0])
+    return printers
+
+
+def print_label_linux(
+    printer_name: str,
+    parti: str,
+    sarj: str,
+    kalite: str,
+    renk: str,
+    mt: float,
+    kg: float,
+    barcode: str,
+) -> None:
+    import subprocess
+    import tempfile
+
+    if not printer_name:
+        raise ValueError("Linux yazici adi bos olamaz")
+
+    label_image = _build_label_image(parti, sarj, kalite, renk, mt, kg, barcode)
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+        temp_path = Path(temp_file.name)
+    try:
+        label_image.save(temp_path, "PNG")
+        subprocess.run(["lpr", "-P", printer_name, str(temp_path)], check=True)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

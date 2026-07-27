@@ -2713,5 +2713,28 @@
     "last_measurement": "12.40 m",
     "saved_at": "2026-07-27T09:29:00",
     "trigger": "manual"
+  },
+  {
+    "barcode": "156",
+    "customer": "İLMEK TEKSTİL",
+    "party_no": "GF-00091-P1",
+    "party_id": "156",
+    "sarj_no": "GF-00091",
+    "kalite": "NAYLON VİSKON",
+    "kalite_talimati": "TEST SARIM",
+    "renk": "SİYAH",
+    "error_category": "",
+    "error_code": "",
+    "error_description": "",
+    "operator_name": "Emre",
+    "operator_surname": "Yılmaz",
+    "operator_userid": "61",
+    "operator_role": "admin",
+    "meter": 18.75,
+    "kg": 12.4,
+    "notes": "",
+    "last_measurement": "18.75 m",
+    "saved_at": "2026-07-27T11:00:41",
+    "trigger": "manual"
   }
 ]
