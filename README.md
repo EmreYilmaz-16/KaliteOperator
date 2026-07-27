@@ -42,6 +42,66 @@ pip install -r requirements.txt
 python app.py
 ```
 
+## Customer Delivery
+
+`python app.py` yaklaşımı son kullanıcı için garanti değildir. Hedef makinede doğru Python sürümü, `pyserial`, `pywin32` ve uygun çalışma klasörü gerekir.
+
+Bu proje için iki çalıştırma yolu vardır:
+
+1. `runapp.bat`
+2. `dist/KaliteOperator/KaliteOperator.exe`
+
+### runapp.bat
+
+- Uygulamayı proje klasöründen başlatır.
+- Önce `.venv\Scripts\python.exe` arar.
+- Yoksa sırasıyla `py -3` ve `python` dener.
+- Gerekli modüller eksikse kullanıcıya bilgi verir.
+
+Bu yöntem daha çok iç kullanım ve destek ekibi içindir.
+
+### Recommended: Build a Single EXE
+
+Müşteriye terminal açtırmamak için önerilen yöntem tek dosya/paket `.exe` dağıtımıdır.
+
+Hazırlık:
+
+```bash
+py -3 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt pyinstaller
+```
+
+Derleme:
+
+```bash
+build_exe.bat
+```
+
+Çıktı:
+
+```text
+dist\KaliteOperator.exe
+```
+
+Bu paket `assets` klasörünü de içerir; login ekranı logoları bu sayede çalışır.
+
+### Customer Install
+
+Derlemeden sonra müşteri kurulumu için:
+
+```bash
+install_customer.bat
+```
+
+Bu script:
+
+- `dist\KaliteOperator.exe` dosyasını `%LOCALAPPDATA%\PBS\KaliteOperator` altına kopyalar
+- `app_settings.json` ve `error_code_groups.json` dosyalarını aynı klasöre taşır
+- yoksa boş `operator_records.json` oluşturur
+- masaüstüne `Kalite Operator` kısayolu bırakır
+
+Not: Uygulama paketli çalışırken ayar, log ve hata kodu dosyalarını exe'nin bulunduğu klasörde tutar. Bu sayede PyInstaller `onefile` modunda veri kaybı yaşanmaz.
+
 ## Terminal Test Without a Physical Device
 
 1. Start the mock sender in a terminal:

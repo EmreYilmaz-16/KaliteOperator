@@ -3,6 +3,7 @@ import copy
 import json
 import queue
 import re
+import sys
 import threading
 import time
 import urllib.error
@@ -94,15 +95,21 @@ LIGHT_THEME = {
     "error": "#b42318",
 }
 
-# Kaydedilen ölçüm kayıtlarının tutulduğu yerel JSON dosyası (app.py ile aynı klasör).
-LOCAL_SAVE_PATH = Path(__file__).with_name("operator_records.json")
-ERROR_CODE_SETTINGS_PATH = Path(__file__).with_name("error_code_groups.json")
-ASSETS_PATH = Path(__file__).with_name("assets")
+# PyInstaller onefile modunda okunur asset'ler gecici bundle klasorunden,
+# yazilabilir dosyalar ise exe'nin bulundugu klasorden yonetilir.
+SOURCE_DIR = Path(__file__).resolve().parent
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", SOURCE_DIR))
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else SOURCE_DIR
+
+# Kaydedilen ölçüm kayıtlarının tutulduğu yerel JSON dosyası.
+LOCAL_SAVE_PATH = APP_DIR / "operator_records.json"
+ERROR_CODE_SETTINGS_PATH = APP_DIR / "error_code_groups.json"
+ASSETS_PATH = BUNDLE_DIR / "assets"
 LIGHT_LOGO_PATH = ASSETS_PATH / "pbs-logo-blue.png"
 DARK_LOGO_PATH = ASSETS_PATH / "pbs-logo-white.png"
 
 # Port, baud, URL ve yazıcı adı gibi uygulama ayarlarının saklandığı JSON dosyası.
-SETTINGS_PATH = Path(__file__).with_name("app_settings.json")
+SETTINGS_PATH = APP_DIR / "app_settings.json"
 
 # Barkod servisi URL'si tanımlı değilken lookup_barcode() tarafından yüklenen test verisi.
 # Offline geliştirme ve demo çalışmaları için kullanılır.
