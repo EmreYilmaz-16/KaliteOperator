@@ -1,4 +1,5 @@
 import csv
+import copy
 import json
 import queue
 import re
@@ -19,27 +20,52 @@ from serial.tools import list_ports
 import label_printer
 
 
+# Seri porttan gelen ham satırdaki sayıyı yakalar.
+# 12.40 / 18,75 / -5 / +42.10 gibi formatları destekler.
 NUMBER_PATTERN = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
+
+# "Makine sıfırda mı?" kontrolünde kullanılan hassasiyet eşiği.
+# Ham değer bu sınırın altındaysa sıfır kabul edilir → yeni partiye geçişe izin verilir.
 MACHINE_ZERO_TOLERANCE = 0.01
+
+# Web servis adresleri. Boş bırakılırsa uygulama test/offline modda çalışır.
+# Gerçek adresler Ayarlar ekranından girilir ve app_settings.json'a kaydedilir.
 LOGIN_URL = ""
 BARCODE_LOOKUP_URL = ""
 SAVE_MEASUREMENT_URL = ""
+
+# Kaydedilen ölçüm kayıtlarının tutulduğu yerel JSON dosyası (app.py ile aynı klasör).
 LOCAL_SAVE_PATH = Path(__file__).with_name("operator_records.json")
+
+# Port, baud, URL ve yazıcı adı gibi uygulama ayarlarının saklandığı JSON dosyası.
 SETTINGS_PATH = Path(__file__).with_name("app_settings.json")
+
+# Barkod servisi URL'si tanımlı değilken lookup_barcode() tarafından yüklenen test verisi.
+# Offline geliştirme ve demo çalışmaları için kullanılır.
 DEFAULT_PARTY_DATA = {
     "customer": "Test Musteri",
     "party_no": "TEST-PARTI-001",
     "party_id": "1001",
     "kalite_talimati": "",
 }
+
+# Login URL'si yokken test şifresiyle giriş yapıldığında dönen sahte kullanıcı verisi.
+# _login_request() içinde offline test modunda kullanılır.
 DEFAULT_LOGIN_RESPONSE = {
     "name": "Test",
     "surname": "Operator",
     "userid": "operator-test",
     "userrole": "operator",
 }
+
+# Offline test şifreleri. Login URL girilince bu şifreler devre dışı kalır.
+# "operator123" → normal operatör rolü, "admin123" → admin rolü (Ayarlar/Debug görünür).
 TEST_USER_PASSWORD = "operator123"
 TEST_ADMIN_PASSWORD = "admin123"
+
+# Hata kodu seçim penceresindeki butonların kaynağı.
+# Her grup bir sütun, her tuple (kod, açıklama) bir buton olur.
+# Yeni hata kodu eklemek için ilgili listeye satır eklemek yeterlidir.
 ERROR_CODE_GROUPS = {
     "BOYAHANE HATA KODLARI": [
         ("1", "AMBRAJ"),
@@ -67,6 +93,7 @@ ERROR_CODE_GROUPS = {
 
 
 def centimeters_to_meters(value: float) -> float:
+    """Santimetre cinsinden verilen değeri metreye çevirir."""
     return value / 100
 
 
@@ -81,7 +108,14 @@ class Measurement:
 
 
 class SerialReader(threading.Thread):
+    """
+    Arka planda çalışan seri port okuyucu thread'i.
+    Gelen verileri satır satır ayrıştırıp output_queue'ya koyar.
+    Prefix formatı: 'DATA|satır', 'INFO|mesaj', 'ERROR|hata'.
+    """
+
     def __init__(self, port_name: str, baud_rate: int, output_queue: queue.Queue[str]):
+        """Port adı, baud rate ve çıktı kuyruğu ile thread'i hazırlar."""
         super().__init__(daemon=True)
         self.port_name = port_name
         self.baud_rate = baud_rate
@@ -92,6 +126,10 @@ class SerialReader(threading.Thread):
         self._last_data_time = 0.0
 
     def run(self) -> None:
+        """
+        Thread ana döngüsü. Porta bağlanır, veri geldiğinde buffer'a ekler,
+        tam satırları kuyruğa iter. Hata veya durdurma sinyalinde temizlik yapar.
+        """
         try:
             self._serial = serial.serial_for_url(self.port_name, self.baud_rate, timeout=1)
             self.output_queue.put(f"INFO|Connected to {self.port_name} at {self.baud_rate} baud")
@@ -112,9 +150,11 @@ class SerialReader(threading.Thread):
             self.output_queue.put("INFO|Disconnected")
 
     def stop(self) -> None:
+        """Thread'e durma sinyali gönderir. Döngü bir sonraki iterasyonda sonlanır."""
         self._stop_event.set()
 
     def _emit_complete_lines(self) -> None:
+        """Buffer'da \r veya \n ile biten tam satırları bulur ve kuyruğa gönderir."""
         while True:
             match = re.search(rb"[\r\n]+", self._buffer)
             if match is None:
@@ -124,12 +164,17 @@ class SerialReader(threading.Thread):
             self._emit_line(raw_line)
 
     def _emit_stale_buffer(self) -> None:
+        """
+        Son veriden bu yana 350ms geçtiyse ve buffer'da satır sonu olmayan
+        yarım veri kalmışsa onu zorla boşaltır.
+        """
         if not self._buffer:
             return
         if self._last_data_time and time.monotonic() - self._last_data_time >= 0.35:
             self._flush_buffer(force=True)
 
     def _flush_buffer(self, force: bool = False) -> None:
+        """force=True verildiğinde buffer'daki tüm veriyi tek satır olarak emit eder."""
         if not self._buffer:
             return
         if force:
@@ -138,13 +183,29 @@ class SerialReader(threading.Thread):
             self._emit_line(raw_line)
 
     def _emit_line(self, raw_line: bytes) -> None:
+        """Ham byte satırını UTF-8 ile decode eder, boş değilse 'DATA|...' formatında kuyruğa koyar."""
         decoded = raw_line.decode("utf-8", errors="ignore").strip()
         if decoded:
             self.output_queue.put(f"DATA|{decoded}")
 
 
 class FabricCounterApp:
+    """
+    Kumaş kalite operatoru baş uygulaması.
+    Seri port'tan metre/kg ölçümü okur, parti bilgisi tutar,
+    barkod sorgular, kayıt eder ve etiket yazdırır.
+    """
+
     def __init__(self, root: tk.Tk):
+        """
+        Uygulamanın tamamını başlatır:
+        - Pencere özellikleri ve boyutları
+        - Tüm durum değişkenleri ve StringVar'lar
+        - UI yapısını inşa eder
+        - Ayarları dosyadan yükler
+        - Kaydedilmiş porta otomatik bağlanır
+        - Periyodik kontroller (seri, web, yazıcı) ve kuyruk işlemeyi başlatır.
+        """
         self.root = root
         self.root.title("Kalite Operator Ekrani")
         self.root.geometry("1366x900")
@@ -157,6 +218,7 @@ class FabricCounterApp:
         self.settings_window: tk.Toplevel | None = None
         self.logs_window: tk.Toplevel | None = None
         self.measurements: list[Measurement] = []
+        self.error_code_groups = copy.deepcopy(ERROR_CODE_GROUPS)
         self.totals = {"m": 0.0, "kg": 0.0}
         self.demo_samples = ["KG: 12.40", "M: 18.75", "18.75 metre", "42.10", "noise", "KG: 5.60"]
         self.demo_index = 0
@@ -175,6 +237,7 @@ class FabricCounterApp:
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="9600")
         self.default_unit_var = tk.StringVar(value="kg")
+        self.machine_zero_tolerance_var = tk.StringVar(value=f"{MACHINE_ZERO_TOLERANCE:.2f}")
         self.login_url_var = tk.StringVar(value=LOGIN_URL)
         self.barcode_lookup_url_var = tk.StringVar(value=BARCODE_LOOKUP_URL)
         self.save_measurement_url_var = tk.StringVar(value=SAVE_MEASUREMENT_URL)
@@ -232,6 +295,11 @@ class FabricCounterApp:
         self.root.after(100, self.process_serial_queue)
 
     def _configure_styles(self) -> None:
+        """
+        ttk widget temasinı ve uygulamaya özel buton/kart renklerini tanımlar.
+        'OperatorSuccess', 'OperatorWarn', 'OperatorInfo', 'OperatorDanger',
+        'OperatorNeutral' buton stilleri ile 'InfoBlue/Warm/Green' kart stilleri burada.
+        """
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
@@ -266,6 +334,14 @@ class FabricCounterApp:
         style.configure("CardValueGreen.TLabel", background="#e9f7ef", foreground="#166534", font=("Segoe UI", 30, "bold"))
 
     def _build_ui(self) -> None:
+        """
+        Tüm sayfaları ve pop-up pencereleri oluşturur:
+        - login_page: şifre giriş ekranı (başlangıçta görünür)
+        - operator_page: operatör çalışma ekranı
+        - settings_window: port/URL/yazıcı ayarları (Toplevel, gizli)
+        - logs_window: kayıt logları tablosu (Toplevel, gizli)
+        - service_window: admin debug/test ekranı (Toplevel, gizli)
+        """
         self.login_page = ttk.Frame(self.root, padding=24)
         self.login_page.pack(fill="both", expand=True)
         self._build_login_page(self.login_page)
@@ -307,6 +383,11 @@ class FabricCounterApp:
         self.service_window.withdraw()
 
     def _build_logs_page(self, container: ttk.Frame) -> None:
+        """
+        Kayıt logları sayfasını inşa eder.
+        Tarih filtresi + 'Bugün' butonu, operator_records.json'dan okunan
+        tüm kayıtları treeview tablosunda gösterir.
+        """
         container.columnconfigure(0, weight=1)
         container.rowconfigure(2, weight=1)
 
@@ -357,6 +438,11 @@ class FabricCounterApp:
         self.logs_tree.configure(yscrollcommand=scrollbar.set)
 
     def _build_settings_page(self, container: ttk.Frame) -> None:
+        """
+        Ayarlar sayfasını inşa eder: seri bağlantı (port/baud/birim),
+        web servis URL'leri (login, barkod, kayıt, health) ve yazıcı seçimi.
+        Sadece admin rolü erişebilir.
+        """
         container.columnconfigure(0, weight=1)
         container.rowconfigure(2, weight=1)
 
@@ -407,17 +493,88 @@ class FabricCounterApp:
             row=5, column=1, pady=6, sticky="w"
         )
 
+        advanced_frame = ttk.LabelFrame(container, text="Makine ve Hata Kodlari", padding=16)
+        advanced_frame.grid(row=2, column=0, sticky="nsew", pady=(16, 0))
+        advanced_frame.columnconfigure(1, weight=1)
+        advanced_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(advanced_frame, text="Sifir Toleransi").grid(row=0, column=0, padx=(0, 8), pady=(0, 10), sticky="w")
+        ttk.Entry(advanced_frame, textvariable=self.machine_zero_tolerance_var, width=14).grid(
+            row=0, column=1, pady=(0, 10), sticky="w"
+        )
+        ttk.Button(advanced_frame, text="Hata Kodlarini Uygula", command=self.apply_error_code_groups).grid(
+            row=0, column=2, padx=(12, 0), pady=(0, 10), sticky="e"
+        )
+        ttk.Label(
+            advanced_frame,
+            text="JSON formatinda grup ve kod listesi duzenlenebilir. Ornek: {\"BOYAHANE HATA KODLARI\": [[\"1\", \"AMBRAJ\"]]}",
+            wraplength=820,
+            justify="left",
+        ).grid(row=0, column=3, padx=(12, 0), pady=(0, 10), sticky="w")
+
+        self.error_code_groups_text = tk.Text(advanced_frame, wrap="word", height=12, font=("Consolas", 11))
+        self.error_code_groups_text.grid(row=1, column=0, columnspan=4, sticky="nsew")
+        self._populate_error_code_groups_editor()
+
         info_frame = ttk.LabelFrame(container, text="Bilgi", padding=16)
-        info_frame.grid(row=2, column=0, sticky="nsew", pady=(16, 0))
+        info_frame.grid(row=3, column=0, sticky="nsew", pady=(16, 0))
         info_frame.columnconfigure(0, weight=1)
         ttk.Label(
             info_frame,
-            text="Ayarlar penceresi admin kullanicilar icindir. Seri baglanti, varsayilan birim, yazici ve servis adresleri buradan yonetilir.",
+            text="Ayarlar penceresi admin kullanicilar icindir. Seri baglanti, varsayilan birim, yazici, servis adresleri, sifir toleransi ve hata kodlari buradan yonetilir.",
             wraplength=900,
             justify="left",
         ).grid(row=0, column=0, sticky="w")
 
+    def _populate_error_code_groups_editor(self) -> None:
+        if not hasattr(self, "error_code_groups_text"):
+            return
+        self.error_code_groups_text.delete("1.0", "end")
+        self.error_code_groups_text.insert(
+            "end",
+            json.dumps(self.error_code_groups, ensure_ascii=False, indent=2),
+        )
+
+    def apply_error_code_groups(self) -> None:
+        if not hasattr(self, "error_code_groups_text"):
+            return
+        raw_text = self.error_code_groups_text.get("1.0", "end").strip()
+        try:
+            parsed = json.loads(raw_text) if raw_text else {}
+            self.error_code_groups = self._normalize_error_code_groups(parsed)
+        except (json.JSONDecodeError, ValueError) as exc:
+            messagebox.showerror("Hata Kodlari", f"Hata kodlari kaydedilemedi: {exc}")
+            return
+        self._save_settings()
+        self.status_var.set("Hata kodlari guncellendi")
+        if self.error_code_window is not None and self.error_code_window.winfo_exists():
+            self._close_error_code_window()
+
+    @staticmethod
+    def _normalize_error_code_groups(data: object) -> dict[str, list[tuple[str, str]]]:
+        if not isinstance(data, dict):
+            raise ValueError("Hata kodlari JSON nesnesi olmali")
+        normalized: dict[str, list[tuple[str, str]]] = {}
+        for group_name, items in data.items():
+            if not isinstance(group_name, str) or not group_name.strip():
+                raise ValueError("Grup adlari bos olmayan metin olmali")
+            if not isinstance(items, list):
+                raise ValueError(f"{group_name} icin deger liste olmali")
+            normalized_items: list[tuple[str, str]] = []
+            for item in items:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    raise ValueError(f"{group_name} icindeki her satir [kod, aciklama] formatinda olmali")
+                code, description = item
+                normalized_items.append((str(code), str(description)))
+            normalized[group_name] = normalized_items
+        return normalized
+
     def _build_login_page(self, container: ttk.Frame) -> None:
+        """
+        Şifre giriş ekranını inşa eder.
+        Enter tuşuyla veya 'Giris Yap' butonuyla login() tetiklenir.
+        Login URL yoksa TEST_USER_PASSWORD / TEST_ADMIN_PASSWORD test şifresiyle girilir.
+        """
         container.columnconfigure(0, weight=1)
         container.rowconfigure(0, weight=1)
 
@@ -459,6 +616,13 @@ class FabricCounterApp:
         self.root.after(50, self.password_entry.focus_set)
 
     def _build_serial_page(self, container: ttk.Frame) -> None:
+        """
+        Admin debug/test ekranını inşa eder.
+        - Port/baud seçimi ve bağlantı kontrolleri
+        - Demo başlat/durdur, diagnostics toggle
+        - Ölçüm geçmişi treeview ve ham veri log metin kutusu
+        - Manuel satır gönderme, oturum temizleme, CSV aktarma
+        """
         container.columnconfigure(0, weight=1)
         container.rowconfigure(2, weight=1)
 
@@ -559,6 +723,14 @@ class FabricCounterApp:
         ttk.Label(diagnostics, textvariable=self.ignored_count_var).grid(row=0, column=5, pady=4, sticky="w")
 
     def _build_operator_page(self, container: ttk.Frame) -> None:
+        """
+        Operatör çalışma ekranını inşa eder:
+        - Üst bar: kullanıcı adı, Ayarlar/Debug/Çıkış butonları
+        - Barkod satırı: Yeni Parti, Barkodu Getir, Hata Kodları, Kaydet/Yazdır
+        - Parti bilgisi kartları (müşteri, parti, renk, kalite talimati vb.)
+        - Anlık değerler (metre/kg) ve yazıcı seçimi
+        - Alt durum çubuğu: COM/WEB/YAZICI bağlantı durumları
+        """
         container.columnconfigure(0, weight=1)
         container.rowconfigure(3, weight=1)
 
@@ -728,6 +900,10 @@ class FabricCounterApp:
         self.printer_status_label.pack(side="left")
 
     def _build_payload_preview(self, container: ttk.Frame, row: int) -> None:
+        """
+        Debug ekranında 'Kaydet' işlemi öncesinde gönderilecek JSON payload'u
+        gösteren salt-okunur metin kutusu oluşturur.
+        """
         payload_frame = ttk.LabelFrame(container, text="Save Payload Preview", padding=12)
         payload_frame.grid(row=row, column=0, sticky="nsew", pady=(12, 0))
         payload_frame.columnconfigure(0, weight=1)
@@ -747,6 +923,10 @@ class FabricCounterApp:
         frame_style: str = "TLabelframe",
         label_style: str = "TLabel",
     ) -> None:
+        """
+        Parti bilgisi bölümünde tek bir bilgi kartı (LabelFrame + Label) oluşturur.
+        row/column konumuna yerleştirilir; stil parçaları renk temasini belirler.
+        """
         tile = ttk.LabelFrame(parent, text=title, padding=16, style=frame_style)
         tile.grid(row=row, column=column, padx=8, pady=8, sticky="nsew")
         parent.rowconfigure(row, weight=1)
@@ -762,11 +942,20 @@ class FabricCounterApp:
         frame_style: str = "TLabelframe",
         label_style: str = "TLabel",
     ) -> None:
+        """
+        Anlık değerler bölümünde metre veya kg özet kartı oluşturur.
+        _create_info_tile'dan farkı: sadece column konumlandırması kullanır.
+        """
         tile = ttk.LabelFrame(parent, text=title, padding=18, style=frame_style)
         tile.grid(row=0, column=column, padx=8, pady=8, sticky="ew")
         ttk.Label(tile, textvariable=variable, style=label_style).pack(anchor="center")
 
     def open_error_code_window(self) -> None:
+        """
+        Hata kodu seçim penceresini açar.
+        Pencere zaten açıksa öne getirir. ERROR_CODE_GROUPS sözlüğündeki
+        gruplar sütun halinde listelenir; seçim set_error_code() ile işlenir.
+        """
         if self.error_code_window is not None and self.error_code_window.winfo_exists():
             self.error_code_window.lift()
             self.error_code_window.focus_force()
@@ -785,7 +974,7 @@ class FabricCounterApp:
         shell.columnconfigure(0, weight=1)
         shell.columnconfigure(1, weight=1)
 
-        for column, (group_name, codes) in enumerate(ERROR_CODE_GROUPS.items()):
+        for column, (group_name, codes) in enumerate(self.error_code_groups.items()):
             group_frame = ttk.LabelFrame(shell, text=group_name, padding=16)
             group_frame.grid(row=0, column=column, padx=10, sticky="nsew")
             group_frame.columnconfigure(0, weight=1)
@@ -802,6 +991,7 @@ class FabricCounterApp:
         ttk.Button(footer, text="Kapat", command=self._close_error_code_window).pack(side="right")
 
     def _close_error_code_window(self) -> None:
+        """Hata kodu penceresini güvenli şekilde kapatır (grab release + destroy)."""
         if self.error_code_window is None:
             return
         if self.error_code_window.winfo_exists():
@@ -810,6 +1000,10 @@ class FabricCounterApp:
         self.error_code_window = None
 
     def set_error_code(self, category: str, code: str, description: str) -> None:
+        """
+        Seçilen hata kodunu current_error_code'a kaydeder, operatör ekranında
+        gösterir ve payload önizlemesini günceller. Ardından pencereyi kapatır.
+        """
         self.current_error_code = {
             "category": category,
             "code": code,
@@ -821,6 +1015,10 @@ class FabricCounterApp:
         self._close_error_code_window()
 
     def clear_error_code_selection(self) -> None:
+        """
+        Seçili hata kodunu sıfırlar, UI göstergelerini 'Hata kodu secilmedi' yapar
+        ve pencere açıksa kapatır.
+        """
         self.current_error_code = {}
         self.selected_error_code_var.set("Hata kodu secilmedi")
         self.refresh_payload_preview()
@@ -828,6 +1026,10 @@ class FabricCounterApp:
             self._close_error_code_window()
 
     def show_service_window(self) -> None:
+        """
+        Admin debug/test penceresini gösterir.
+        Giriş yapılmamışsa veya kullanıcı admin değilse erişim reddedilir.
+        """
         if not self.current_user_data:
             self.login_status_var.set("Servis ekranina erismek icin once giris yapin")
             return
@@ -841,6 +1043,10 @@ class FabricCounterApp:
         self.service_window.focus_force()
 
     def show_settings_window(self) -> None:
+        """
+        Ayarlar penceresini gösterir.
+        Giriş yapılmamışsa veya kullanıcı admin değilse erişim reddedilir.
+        """
         if not self.current_user_data:
             self.login_status_var.set("Ayarlar ekranina erismek icin once giris yapin")
             return
@@ -854,6 +1060,10 @@ class FabricCounterApp:
         self.settings_window.focus_force()
 
     def show_logs_window(self) -> None:
+        """
+        Kayıt logları penceresini gösterir; açılmadan önce tabloyu günceller.
+        Giriş yapılmamışsa veya kullanıcı admin değilse erişim reddedilir.
+        """
         if not self.current_user_data:
             self.login_status_var.set("Kayit loglari ekranina erismek icin once giris yapin")
             return
@@ -868,6 +1078,10 @@ class FabricCounterApp:
         self.logs_window.focus_force()
 
     def _toggle_service_window(self, _event: tk.Event | None = None) -> str | None:
+        """
+        Ctrl+Shift+D kısayoluyla debug penceresini açıp kapatir (toggle).
+        Admin değilse 'break' döndürerek olayı yürtmez.
+        """
         if self.service_window is None:
             return None
         if not self._is_admin():
@@ -879,14 +1093,20 @@ class FabricCounterApp:
         return "break"
 
     def _exit_fullscreen(self, _event: tk.Event | None = None) -> str:
+        """ESC tuşuyla tam ekrandan çıkar."""
         self.root.attributes("-fullscreen", False)
         return "break"
 
     def _enter_fullscreen(self, _event: tk.Event | None = None) -> str:
+        """F11 tuşuyla tam ekrana geri döner."""
         self.root.attributes("-fullscreen", True)
         return "break"
 
     def login(self) -> None:
+        """
+        Şifre alanından şifreyi alıp validasyonu yapar.
+        Boş değilse arka plan thread'inde _login_request()'i çalıştırır.
+        """
         password = self.password_var.get().strip()
         if not password:
             self.login_status_var.set("Sifre zorunludur")
@@ -896,6 +1116,12 @@ class FabricCounterApp:
         threading.Thread(target=self._login_request, args=(password,), daemon=True).start()
 
     def _login_request(self, password: str) -> None:
+        """
+        Login işlemini arka planda gerçekleştirir.
+        - login_url ayarlanmışsa: JSON body ile HTTP POST atar, yanıtı doğrular.
+        - URL yoksa: TEST_USER_PASSWORD ve TEST_ADMIN_PASSWORD ile offline test modu.
+        Başarılı yanıtta _apply_login_success() ana thread'de çağrılır.
+        """
         login_url = self.login_url_var.get().strip()
         if not login_url:
             if password == TEST_USER_PASSWORD:
@@ -943,6 +1169,10 @@ class FabricCounterApp:
         self.root.after(0, lambda: self._apply_login_success(data, "Giris basarili"))
 
     def _apply_login_success(self, data: dict[str, object], status_message: str) -> None:
+        """
+        Giriş başarılı olduğunda kullanıcı bilgilerini kaydeder,
+        rol bazında butonları güncelleir ve operatör sayfasına geçer.
+        """
         self.current_user_data = {
             "name": str(data.get("name", "")),
             "surname": str(data.get("surname", "")),
@@ -960,6 +1190,11 @@ class FabricCounterApp:
         self.root.after(50, self.barcode_entry.focus_set)
 
     def logout(self) -> None:
+        """
+        Oturumu kapatır: seri bağlantıyı keser, pop-up pencereleri gizler,
+        kullanıcı verisini temizler ve login sayfasına döner.
+        Oturum ölçümleri ve parti bağlamı da sıfırlanır.
+        """
         self.disconnect()
         if self.service_window is not None:
             self.service_window.withdraw()
@@ -980,9 +1215,14 @@ class FabricCounterApp:
         self.root.after(50, self.password_entry.focus_set)
 
     def _is_admin(self) -> bool:
+        """Oturumdaki kullanıcının rolünün 'admin' olup olmadığını kontrol eder."""
         return self.current_user_data.get("userrole", "").strip().lower() == "admin"
 
     def _apply_role_access(self) -> None:
+        """
+        Kullanıcı rolüne göre üst menü butonlarını gösterir/gizler.
+        Admin ise Ayarlar, Kayıt Logları ve Debug/Test butonları görünür olur.
+        """
         if not hasattr(self, "service_button") or not hasattr(self, "settings_button") or not hasattr(self, "logs_button"):
             return
         self.service_button.pack_forget()
@@ -994,10 +1234,16 @@ class FabricCounterApp:
             self.service_button.pack(side="left", padx=(0, 8))
 
     def _set_logs_today_filter(self) -> None:
+        """Log tarih filtresini bugüne ayarlar ve tabloyu yeniler."""
         self.log_date_filter_var.set(datetime.now().strftime("%Y-%m-%d"))
         self.refresh_logs_view()
 
     def refresh_logs_view(self) -> None:
+        """
+        Kayıt logları tablosunu operator_records.json'dan okuyarak günceller.
+        log_date_filter_var'daki tarihe göre süzgü uygular ('YYYY-MM-DD' formatı).
+        Boş bırakılırsa tüm kayıtlar listelenir.
+        """
         if not hasattr(self, "logs_tree"):
             return
 
@@ -1041,6 +1287,10 @@ class FabricCounterApp:
         self.log_summary_var.set(f"{len(filtered_records)} kayit listelendi")
 
     def _load_saved_records(self) -> list[dict[str, object]]:
+        """
+        LOCAL_SAVE_PATH (operator_records.json) dosyasından tüm kayıtları okur.
+        Dosya yoksa, bozuksa veya liste değilse boş liste döndürür.
+        """
         if not LOCAL_SAVE_PATH.exists():
             return []
         try:
@@ -1052,11 +1302,16 @@ class FabricCounterApp:
         return [item for item in data if isinstance(item, dict)]
 
     def _create_stat_card(self, parent: ttk.Frame, column: int, title: str, variable: tk.StringVar) -> None:
+        """Debug ekranında üst satırda gösterilen küçük istatistik kartı oluşturur."""
         card = ttk.LabelFrame(parent, text=title, padding=12)
         card.grid(row=0, column=column, padx=6, sticky="ew")
         ttk.Label(card, textvariable=variable, font=("Segoe UI", 18, "bold")).pack(anchor="center")
 
     def refresh_ports(self) -> None:
+        """
+        Sistemdeki COM portlarını tarar, combobox listelerini günceller.
+        Uygun port yoksa ilkini seçer. Yazıcı listesini ve seri durum göstergesini de yeniler.
+        """
         ports = [port.device for port in list_ports.comports()]
         self.port_combo["values"] = ports
         if hasattr(self, "settings_port_combo"):
@@ -1070,10 +1325,15 @@ class FabricCounterApp:
         self.status_var.set(f"{len(ports)} port(s) found")
 
     def _setup_setting_traces(self) -> None:
+        """
+        Tüm ayar değişkenlerine (port, baud, URL'ler, yazıcı vb.) 'write' trace ekler.
+        Değişen her ayar otomatik olarak _on_setting_changed() ile kaydedilir.
+        """
         variables = [
             self.port_var,
             self.baud_var,
             self.default_unit_var,
+            self.machine_zero_tolerance_var,
             self.login_url_var,
             self.barcode_lookup_url_var,
             self.save_measurement_url_var,
@@ -1085,12 +1345,22 @@ class FabricCounterApp:
             variable.trace_add("write", self._on_setting_changed)
 
     def _on_setting_changed(self, *_args: object) -> None:
+        """
+        Herhangi bir ayar değiştiğinde tetiklenir:
+        - Ayarları JSON'a kaydeder
+        - Seri ve yazıcı durum göstergelerini günceller
+        - Web servis sağlık kontrolu başlatır
+        """
         self._save_settings()
         self._update_serial_connection_status()
         self._update_printer_connection_status()
         self._request_webservice_health_check()
 
     def _load_settings(self) -> None:
+        """
+        app_settings.json dosyasından ayarları okuyup ilgili StringVar/BooleanVar'lara yazar.
+        Dosya yoksa veya geçersizse mevcut varsayılan değerler korunur.
+        """
         if not SETTINGS_PATH.exists():
             return
         try:
@@ -1103,24 +1373,36 @@ class FabricCounterApp:
         self.port_var.set(str(data.get("port", self.port_var.get())))
         self.baud_var.set(str(data.get("baud", self.baud_var.get())))
         self.default_unit_var.set(str(data.get("default_unit", self.default_unit_var.get())))
+        self.machine_zero_tolerance_var.set(str(data.get("machine_zero_tolerance", self.machine_zero_tolerance_var.get())))
         self.login_url_var.set(str(data.get("login_url", self.login_url_var.get())))
         self.barcode_lookup_url_var.set(str(data.get("barcode_lookup_url", self.barcode_lookup_url_var.get())))
         self.save_measurement_url_var.set(str(data.get("save_measurement_url", self.save_measurement_url_var.get())))
         self.health_url_var.set(str(data.get("health_url", self.health_url_var.get())))
         self.printer_name_var.set(str(data.get("printer_name", self.printer_name_var.get())))
         self.auto_print_var.set(bool(data.get("auto_print", self.auto_print_var.get())))
+        try:
+            self.error_code_groups = self._normalize_error_code_groups(data.get("error_code_groups", self.error_code_groups))
+        except ValueError:
+            self.error_code_groups = copy.deepcopy(ERROR_CODE_GROUPS)
+        self._populate_error_code_groups_editor()
 
     def _save_settings(self) -> None:
+        """
+        Mevcut ayar değişkenlerini app_settings.json dosyasına JSON formatında kaydeder.
+        Yazım hatası oluşursa sessizce göz ardı edilir.
+        """
         settings_payload = {
             "port": self.port_var.get().strip(),
             "baud": self.baud_var.get().strip(),
             "default_unit": self.default_unit_var.get().strip(),
+            "machine_zero_tolerance": self.machine_zero_tolerance_var.get().strip(),
             "login_url": self.login_url_var.get().strip(),
             "barcode_lookup_url": self.barcode_lookup_url_var.get().strip(),
             "save_measurement_url": self.save_measurement_url_var.get().strip(),
             "health_url": self.health_url_var.get().strip(),
             "printer_name": self.printer_name_var.get().strip(),
             "auto_print": self.auto_print_var.get(),
+            "error_code_groups": self.error_code_groups,
         }
         try:
             SETTINGS_PATH.write_text(json.dumps(settings_payload, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -1128,6 +1410,10 @@ class FabricCounterApp:
             return
 
     def _auto_connect_saved_port(self) -> None:
+        """
+        Uygulama başlatılırken kaydetilen port adı varsa ve bağlanılı değilse
+        otomatik olarak seri porta bağlanmayı dener.
+        """
         port_name = self.port_var.get().strip()
         if not port_name:
             return
@@ -1136,17 +1422,26 @@ class FabricCounterApp:
         self.connect()
 
     def _schedule_connectivity_checks(self) -> None:
+        """
+        Her 15 saniyede bir seri port, yazıcı ve web servis bağlantı durumlarını
+        kontrol eden periyodik döngüyü yönetir.
+        """
         self._update_serial_connection_status()
         self._update_printer_connection_status()
         self._request_webservice_health_check()
         self.root.after(15000, self._schedule_connectivity_checks)
 
     def _set_status_label(self, label: tk.Label | None, variable: tk.StringVar, text: str, color: str) -> None:
+        """Verilen StringVar'a metin, Label widget'a renk atar. Kod tekrarını azaltan yardımcı."""
         variable.set(text)
         if label is not None:
             label.configure(fg=color)
 
     def _update_serial_connection_status(self) -> None:
+        """
+        Alt durum çubuğundaki COM göstergesini günceller:
+        BAGLI (yeşil) / HAZIR (sarı) / BULUNAMADI (kırmızı) / SECiLMEDi (kırmızı).
+        """
         port_name = self.port_var.get().strip()
         available_ports = list(self.port_combo.cget("values")) if hasattr(self, "port_combo") else []
         if self.reader and self.reader.is_alive():
@@ -1161,6 +1456,10 @@ class FabricCounterApp:
         self._set_status_label(self.serial_status_label, self.serial_connection_var, "COM: SECILMEDI", "#b42318")
 
     def _update_printer_connection_status(self) -> None:
+        """
+        Alt durum çubuğundaki YAZICI göstergesini günceller:
+        HAZIR (yeşil) / BULUNAMADI (kırmızı) / SECiLMEDi (kırmızı).
+        """
         printer_name = self.printer_name_var.get().strip()
         if printer_name and printer_name in self.available_printers:
             self._set_status_label(self.printer_status_label, self.printer_connection_var, f"YAZICI: HAZIR ({printer_name})", "#0f5f35")
@@ -1171,6 +1470,11 @@ class FabricCounterApp:
         self._set_status_label(self.printer_status_label, self.printer_connection_var, "YAZICI: SECILMEDI", "#b42318")
 
     def _resolve_health_url(self) -> str:
+        """
+        Web servis sağlık kontrol URL'sini belirler.
+        Explicit olarak girilmişse onu kullanır; yoksa kayıt/barkod/login URL'lerinden
+        '/health' yolu otomatik oluşturulur.
+        """
         explicit_url = self.health_url_var.get().strip()
         if explicit_url:
             return explicit_url
@@ -1191,6 +1495,10 @@ class FabricCounterApp:
         return ""
 
     def _request_webservice_health_check(self) -> None:
+        """
+        Sağlık kontrol URL'si mevcutsa ve uçuca bir istek yoksa arka plan
+        thread'inde _check_webservice_health()'i başlatır.
+        """
         health_url = self._resolve_health_url()
         if not health_url:
             self._set_status_label(self.webservice_status_label, self.webservice_connection_var, "WEB: AYARLANMADI", "#9a6700")
@@ -1201,6 +1509,11 @@ class FabricCounterApp:
         threading.Thread(target=self._check_webservice_health, args=(health_url,), daemon=True).start()
 
     def _check_webservice_health(self, health_url: str) -> None:
+        """
+        Health endpoint'e HTTP GET atar. 2xx ise WEB: BAGLI (yeşil),
+        hata kodunda WEB: HATA, bağlanamıyorsa WEB: ULAŞILAMIYOR gösterir.
+        web_health_check_inflight bayrağını sonunda sıfırlar.
+        """
         try:
             request = urllib.request.Request(health_url, method="GET")
             with urllib.request.urlopen(request, timeout=5) as response:
@@ -1239,6 +1552,10 @@ class FabricCounterApp:
             self.web_health_check_inflight = False
 
     def _refresh_printers(self) -> None:
+        """
+        win32print ile sistemdeki yazıcıları listeler, available_printers'a kaydeder
+        ve ilgili combobox'ları günceller. win32print bulunamazsa liste boş kalır.
+        """
         try:
             import win32print as _wp  # type: ignore[import-untyped]
             printer_names = [p[2] for p in _wp.EnumPrinters(_wp.PRINTER_ENUM_LOCAL | _wp.PRINTER_ENUM_CONNECTIONS)]
@@ -1254,6 +1571,10 @@ class FabricCounterApp:
         self._update_printer_connection_status()
 
     def connect(self) -> None:
+        """
+        Seçili COM portuna seri bağlantı kurar.
+        SerialReader thread başlatılır; önceden demo çalışıyorsa durdurulur.
+        """
         if self.reader and self.reader.is_alive():
             messagebox.showinfo("Connection", "Serial port is already connected.")
             return
@@ -1278,6 +1599,7 @@ class FabricCounterApp:
         self._update_serial_connection_status()
 
     def disconnect(self) -> None:
+        """Seri bağlantıyı ve varsa demo akışını durdurur; kaynak durumunu 'Idle' yapar."""
         if self.reader:
             self.reader.stop()
             self.reader = None
@@ -1287,6 +1609,11 @@ class FabricCounterApp:
         self._update_serial_connection_status()
 
     def start_demo(self) -> None:
+        """
+        Dahili demo veri akışını başlatır.
+        Seri bağlantı varsa izin vermez. demo_samples listesindeki örnekleri
+        900ms aralıklarla handle_serial_line()'a gönderir.
+        """
         if self.reader and self.reader.is_alive():
             messagebox.showinfo("Demo", "Disconnect the serial connection before starting demo data.")
             return
@@ -1298,12 +1625,17 @@ class FabricCounterApp:
         self.schedule_demo_line()
 
     def schedule_demo_line(self) -> None:
+        """
+        demo_samples listesinden sıradaki satırı handle_serial_line()'a gönderir
+        ve kendini 900ms sonra tekrar çağırır (after loop).
+        """
         line = self.demo_samples[self.demo_index % len(self.demo_samples)]
         self.demo_index += 1
         self.handle_serial_line(line)
         self.demo_job = self.root.after(900, self.schedule_demo_line)
 
     def stop_demo(self) -> None:
+        """Demo after loop'unu iptal eder. Seri bağlantı da yoksa durum mesajını günceller."""
         if self.demo_job is not None:
             self.root.after_cancel(self.demo_job)
             self.demo_job = None
@@ -1311,6 +1643,10 @@ class FabricCounterApp:
                 self.status_var.set("Demo stream stopped")
 
     def send_manual_line(self) -> None:
+        """
+        Debug ekranındaki manuel satır giriş kutusundaki değeri
+        doğrudan handle_serial_line()'a gönderir (test amaçlı).
+        """
         line = self.manual_line_var.get().strip()
         if not line:
             messagebox.showwarning("Manual Test", "Enter a line to test first.")
@@ -1319,6 +1655,13 @@ class FabricCounterApp:
         self.handle_serial_line(line)
 
     def process_serial_queue(self) -> None:
+        """
+        Her 100ms'de Tkinter after ile çağrılır.
+        serial_queue'daki mesajları tüketir:
+        - 'DATA|...' → handle_serial_line()
+        - 'ERROR|...' → hata mesaj kutusu
+        - Diğer → durum çubuğu + log
+        """
         while not self.serial_queue.empty():
             message = self.serial_queue.get_nowait()
             prefix, payload = message.split("|", 1)
@@ -1334,6 +1677,14 @@ class FabricCounterApp:
         self.root.after(100, self.process_serial_queue)
 
     def handle_serial_line(self, line: str) -> None:
+        """
+        Gelen ham satırı işler:
+        - Loga yazar
+        - parse_measurement() ile ayrıştırır
+        - Parse edilemezse ignore sayıcısını artırır
+        - Başarılıysa totalleri, UI değişkenlerini ve treeview'i günceller
+        - Top sonu algılanırsa operatörü uyarır
+        """
         self.append_log(line)
         measurement = self.parse_measurement(line)
         if measurement is None:
@@ -1366,6 +1717,14 @@ class FabricCounterApp:
             self.operator_status_var.set("Top sonu algilandi. Kaydet / Yazdir butonuna basin.")
 
     def parse_measurement(self, line: str) -> Measurement | None:
+        """
+        Ham metin satırından sayısal ölçümü ayrıştırır ve Measurement nesnesi döndürür.
+        - Satırda sayı yoksa None döner (göz ardı edilir).
+        - 'KG' anahtar kelimesi → kg birimi
+        - 'metre'/'meter'/tek 'm' → metre birimi (cm birimiyle geliyorsa 100'e bölür)
+        - İki sayı + birim yoksa → ilki metre(cm), ikincisi kg ("pair" modu)
+        - Hiçbir birim ipucu yoksa default_unit_var kullanılır.
+        """
         lowered = line.lower()
         numbers = NUMBER_PATTERN.findall(lowered)
         if not numbers:
@@ -1401,12 +1760,17 @@ class FabricCounterApp:
         )
 
     def append_log(self, message: str) -> None:
+        """Debug ekranındaki ham veri metin kutusuna zaman damgalı mesaj ekler."""
         self.log_text.configure(state="normal")
         self.log_text.insert("end", f"{datetime.now():%H:%M:%S} {message}\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
     def clear_session(self) -> None:
+        """
+        Mevcut oturumun tüm ölçüm verilerini, toplamları ve UI göstergelerini sıfırlar.
+        Seri bağlantı ve parti bilgisi korunur; sadece ölçüm geçmişi temizlenir.
+        """
         self.measurements.clear()
         self.totals = {"m": 0.0, "kg": 0.0}
         self.parsed_count = 0
@@ -1436,6 +1800,11 @@ class FabricCounterApp:
         self.refresh_payload_preview()
 
     def start_new_party(self) -> None:
+        """
+        Yeni partiye geçiş işlemini gerçekleştirir.
+        Önce makine sıfırda olup olmadığını kontrol eder (MACHINE_ZERO_TOLERANCE);
+        sıfırda değilse uyarı gösterir. Başarılıysa oturumu ve parti bağlamını temizler.
+        """
         if not self._machine_is_zero():
             self.operator_status_var.set("Makine sifirda degil. Once makine reset butonuna basin.")
             messagebox.showwarning(
@@ -1450,15 +1819,27 @@ class FabricCounterApp:
         self.root.after(50, self.barcode_entry.focus_set)
 
     def _machine_is_zero(self) -> bool:
+        """
+        Makine ham değerlerinin (metre, kg ve toplam) tümünün
+        MACHINE_ZERO_TOLERANCE (0.01) sınırı içinde sıfır sayılıp sayılamayacağını kontrol eder.
+        """
         values = (
             self.current_meter_raw,
             self.current_kg_raw,
             self.totals["m"],
             self.totals["kg"],
         )
-        return all(abs(value) <= MACHINE_ZERO_TOLERANCE for value in values)
+        try:
+            tolerance = float(self.machine_zero_tolerance_var.get().strip())
+        except ValueError:
+            tolerance = MACHINE_ZERO_TOLERANCE
+        return all(abs(value) <= tolerance for value in values)
 
     def _clear_party_context(self) -> None:
+        """
+        Barkod, müşteri, parti no, renk, kalite talimati gibi tüm parti
+        bilgilerini ve hata kodu seçimini sıfırlar; payload önizlemesini günceller.
+        """
         self.current_party_data = {}
         self.barcode_var.set("")
         self.customer_var.set("-")
@@ -1473,6 +1854,10 @@ class FabricCounterApp:
         self.refresh_payload_preview()
 
     def export_csv(self) -> None:
+        """
+        Mevcut oturumdaki ölçümleri kullanıcının seçtiği yola CSV formatında aktarır.
+        Ölçüm yoksa uyarı gösterir.
+        """
         if not self.measurements:
             messagebox.showinfo("Export", "No measurements to export.")
             return
@@ -1505,6 +1890,11 @@ class FabricCounterApp:
         self.status_var.set(f"Exported to {path.name}")
 
     def lookup_barcode(self) -> None:
+        """
+        Barkod alanındaki değeri sorgular.
+        - barcode_lookup_url ayarlıysa arka plan thread'inde HTTP GET atar.
+        - URL yoksa DEFAULT_PARTY_DATA ile test verisi yükler.
+        """
         barcode = self.barcode_var.get().strip()
         if not barcode:
             messagebox.showwarning("Barcode", "Scan or enter a barcode first.")
@@ -1517,6 +1907,10 @@ class FabricCounterApp:
         threading.Thread(target=self._lookup_barcode_request, args=(barcode,), daemon=True).start()
 
     def _lookup_barcode_request(self, barcode: str) -> None:
+        """
+        Barkod servisi URL'sine ?barcode=... parametresiyle GET isteği atar.
+        Başarılı yanıtta load_party_data() ana thread'de çağrılır.
+        """
         try:
             barcode_lookup_url = self.barcode_lookup_url_var.get().strip()
             url = f"{barcode_lookup_url.rstrip('/')}?barcode={urllib.parse.quote(barcode)}"
@@ -1530,6 +1924,11 @@ class FabricCounterApp:
         self.root.after(0, lambda: self.load_party_data(data))
 
     def load_party_data(self, data: dict, status_message: str = "Barcode loaded") -> None:
+        """
+        API veya test verisinden gelen parti bilgilerini (_first_value ile esnek alan
+        okuması yaparak) current_party_data'ya kaydeder ve UI kartlarını günceller.
+        Birden fazla olası alan adı (Türkçe/İngilizce) desteklenir.
+        """
         customer = self._first_value(data, ["customer", "musteri", "customer_name", "cari_unvan"])
         party_no = self._first_value(data, ["party_no", "parti_no", "batch_no", "lot_no"])
         party_id = self._first_value(data, ["party_id", "parti_id", "batch_id", "id"])
@@ -1561,6 +1960,14 @@ class FabricCounterApp:
         self.refresh_payload_preview()
 
     def save_operator_record(self, print_label: bool = False) -> None:
+        """
+        Mevcut kayıtı işler:
+        1. Parti yüklenmemişse uyarı gösterir.
+        2. _persist_record() ile operator_records.json'a yazar.
+        3. _soft_reset_after_save() ile metreyi sıfırlar.
+        4. save_measurement_url ayarlıysa HTTP POST atar (arka plan thread).
+        5. print_label=True veya auto_print açıksa etiketi yazdırır.
+        """
         payload = self.build_save_payload()
         if not payload["party_id"] and not payload["party_no"]:
             messagebox.showwarning("Save", "Load party information before saving.")
@@ -1581,6 +1988,10 @@ class FabricCounterApp:
                 self.operator_status_var.set(f"Saved to {LOCAL_SAVE_PATH.name} and reset to zero")
 
     def _save_operator_record_request(self, payload: dict[str, object], print_label: bool) -> None:
+        """
+        Kayıt verisini uzak sunucuya HTTP POST ile gönderir.
+        Sunucu ek barkod döndürebilir; bu durumda etikette yeni barkod kullanılır.
+        """
         try:
             body = json.dumps(payload).encode("utf-8")
             save_measurement_url = self.save_measurement_url_var.get().strip()
@@ -1613,6 +2024,10 @@ class FabricCounterApp:
         self.root.after(0, on_success)
 
     def build_save_payload(self) -> dict[str, object]:
+        """
+        Kayıt için gönderilecek tüm alanları tek bir dict'te toplar:
+        parti bilgisi, operatör bilgisi, ölçüm değerleri, hata kodu, not ve zaman damgası.
+        """
         payload = {
             "barcode": self.current_party_data.get("barcode") or self.barcode_var.get().strip(),
             "customer": self.current_party_data.get("customer", ""),
@@ -1638,6 +2053,10 @@ class FabricCounterApp:
         return payload
 
     def refresh_payload_preview(self) -> None:
+        """
+        Debug ekranındaki JSON önizleme kutusunu günceller.
+        Bu pencere açık değilse (payload_preview widget'i yoksa) sessizce döner.
+        """
         if not hasattr(self, "payload_preview"):
             return
         payload = self.build_save_payload()
@@ -1647,6 +2066,10 @@ class FabricCounterApp:
         self.payload_preview.configure(state="disabled")
 
     def _update_last_captured_values(self, measurement: Measurement) -> None:
+        """
+        Yeni bir ölçüm geldiğinde son geçerli metre/kg değerlerini kaydeder
+        (toplam > 0 olduğunda güncellenir; top sonu etiketi için kullanılır).
+        """
         if measurement.meter_value is not None and self.totals["m"] > 0:
             self.last_meter_value = self.totals["m"]
             self.last_meter_var.set(f"{self.totals['m']:.2f} m")
@@ -1655,10 +2078,20 @@ class FabricCounterApp:
             self.last_kg_var.set(f"{self.totals['kg']:.2f} kg")
 
     def _is_top_end_measurement(self, measurement: Measurement) -> bool:
+        """
+        Metre değerinin sıfıra düştüğünü ve önceki toplamda metre/kg veri olduğunu
+        kontrol eder. Bu durum 'top sonu' sinyalü sayılır.
+        """
         meter_zero_detected = measurement.meter_value == 0 or (measurement.unit == "m" and measurement.value == 0)
         return meter_zero_detected and (self.last_meter_value > 0 or self.last_kg_value > 0)
 
     def _auto_save_on_zero(self, measurement: Measurement) -> None:
+        """
+        Metre sıfıra düştüğünde, auto_save_armed ve meter_cycle_active bayrakları
+        doğruysa otomatik kayıt yapar. Aynı verinin tekrar kaydedilmemesi için
+        imza (signature) karşılaştırması yapar.
+        NOT: Bu metot şu an handle_serial_line içinden çağrılmıyor; ilerideki kullanım için hazır.
+        """
         meter_zero_detected = measurement.meter_value == 0 or (measurement.unit == "m" and measurement.value == 0)
         if not meter_zero_detected or not self.auto_save_armed or not self.meter_cycle_active:
             return
@@ -1685,6 +2118,13 @@ class FabricCounterApp:
         self.operator_status_var.set(f"Auto saved to {LOCAL_SAVE_PATH.name} and reset to zero")
 
     def _apply_measurement(self, measurement: Measurement) -> None:
+        """
+        Gelen ölçümü totallere uygular:
+        - Metre geldiğinde: raw değeri kaydeder, offset'i hesaplar, totals['m'] = raw - offset
+        - kg geldiğinde: totals['kg'] = raw (negatif değerleri sıfırlar)
+        - 'pair' modunda her ikisini birden günceller.
+        parse_status_var ve last_value_var UI göstergelerini günceller.
+        """
         if measurement.meter_value is not None:
             self.current_meter_raw = measurement.meter_value
             if self.current_meter_raw < self.meter_offset:
@@ -1723,6 +2163,10 @@ class FabricCounterApp:
         ).start()
 
     def _do_print_label(self, payload: dict, printer_name: str) -> None:
+        """
+        label_printer.print_label_win() çağrısını yapıp etiketi basma işlemini gerçekleştirir.
+        Arka plan thread'inde çalışır. Hata oluşursa operatör durum çubuğuna mesaj yazar.
+        """
         try:
             label_printer.print_label_win(
                 printer_name=printer_name,
@@ -1743,6 +2187,12 @@ class FabricCounterApp:
         self._print_label_background(self.build_save_payload())
 
     def _soft_reset_after_save(self) -> None:
+        """
+        Kayıt sonrası kısmi sıfırlama yapar:
+        - Metre toplamı sıfırlanır (metre_offset = mevcut ham değer olarak ayarlanır)
+        - kg toplamı mevcut ham değerle korunur (topa devam ediliyor olabilir)
+        - Hata kodu seçimi temizlenir, payload önizlemesi güncellenir.
+        """
         self.meter_offset = self.current_meter_raw
         self.totals["m"] = 0.0
         self.totals["kg"] = max(self.current_kg_raw, 0.0)
@@ -1758,6 +2208,11 @@ class FabricCounterApp:
         self.refresh_payload_preview()
 
     def _persist_record(self, payload: dict[str, object], trigger: str) -> None:
+        """
+        Kayıtı operator_records.json dosyasına ekler (append).
+        trigger alanı kaydın 'manual' veya 'auto_zero_m' gibi çagriş kaynağını belirtir.
+        Dosya bozuksa yeni liste oluşturulur. Kayıttan sonra log tablosu yenilenir.
+        """
         record = dict(payload)
         record["trigger"] = trigger
         records: list[dict[str, object]] = []
@@ -1775,6 +2230,11 @@ class FabricCounterApp:
 
     @staticmethod
     def _first_value(data: dict, keys: list[str]) -> str:
+        """
+        Verilen dict'te keys listesindeki ilk dolu değeri döndürür.
+        Tüm anahtarlara karşılık gelen değer yoksa veya boşsa boş string döner.
+        API cevaplarında Türkçe/İngilizce alan adlarını birlikte desteklemek için kullanılır.
+        """
         for key in keys:
             value = data.get(key)
             if value is not None and value != "":
@@ -1783,6 +2243,7 @@ class FabricCounterApp:
 
 
 def main() -> None:
+    """Uygulamayı başlatır: Tkinter penceresi oluşturur, FabricCounterApp'i yükler ve event döngüsünü çalıştırır."""
     root = tk.Tk()
     app = FabricCounterApp(root)
     root.protocol("WM_DELETE_WINDOW", lambda: on_close(root, app))
@@ -1790,6 +2251,7 @@ def main() -> None:
 
 
 def on_close(root: tk.Tk, app: FabricCounterApp) -> None:
+    """Pencere kapatılırken seri bağlantıyı temiz şekilde keser, ardından pencereyi yıkar."""
     app.disconnect()
     root.destroy()
 
